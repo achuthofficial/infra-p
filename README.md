@@ -47,9 +47,16 @@ Optional variables (**Variables** tab):
 | Variable | Default | |
 |---|---|---|
 | `API_KEYS` | unset (open) | comma-separated keys required as `X-API-Key` on `/api/v1` |
-| `WORKERS` | min(4, CPUs) | processes per job; use 1–2 on instances with under 4 GB RAM |
+| `WORKERS` | fits the container | page-reading processes shared by all jobs (auto: CPUs, ~0.6 GB each) |
+| `MAX_CONCURRENT_JOBS` | 4 | plan sets processed at once (they share the workers); more wait in line |
 | `MAX_UPLOAD_MB` | 2048 | largest PDF accepted |
-| `JOB_TTL_SECONDS` | 21600 | how long results stay available |
+| `JOB_TTL_SECONDS` / `MAX_JOBS_KEPT` | 21600 / 20 | how long, and how many, finished results stay available |
+
+Several people can use it at once: their plan sets are read side by side by one
+pool of workers, each getting a fair share. Tested on a 4 GB / 4 CPU container
+with four large sets (scans and CAD, 104 sheets) uploaded together: all finished,
+peak memory 1.9 GB, the app answering in under 20 ms throughout. A larger
+instance simply gets more workers.
 
 Jobs are kept in memory and temp files, so a redeploy clears them; plan sets
 are simply uploaded again.

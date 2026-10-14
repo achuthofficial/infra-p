@@ -2,8 +2,9 @@
 Jobs: an uploaded plan set, processed in the background, and its result.
 
 Processing a plan set takes seconds to minutes, so uploads return at once
-and the client polls the job. Jobs run MAX_CONCURRENT_JOBS at a time (each
-already uses every core); the rest wait as "queued". Jobs live in memory and
+and the client polls the job. Jobs run MAX_CONCURRENT_JOBS at a time, their
+pages read by one pool of worker processes they share fairly (pool.PagePool);
+the rest wait as "queued", in upload order. Jobs live in memory and
 expire after JOB_TTL_SECONDS; nothing is written to disk except the upload
 itself, which is kept while its job lives (for the annotated PDF export and
 the calibration) and deleted with it.
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from fastapi import HTTPException
 
 from gdot_earthwork.plan_set import PlanSetResult, process_plan_set
+from gdot_earthwork.pool import PagePool
 
 from . import settings
 from .payload import serialize
@@ -56,10 +58,16 @@ SLOTS = threading.BoundedSemaphore(settings.MAX_CONCURRENT_JOBS)
 
 
 def expire_jobs() -> None:
+    """Drop finished jobs older than JOB_TTL_SECONDS, and beyond the newest
+    MAX_JOBS_KEPT finished ones (their results and PDFs are what the server's
+    memory and disk hold)."""
     cutoff = time.time() - settings.JOB_TTL_SECONDS
     with LOCK:
-        for k in [k for k, j in JOBS.items() if j.created < cutoff and j.status in ("done", "error")]:
-            job = JOBS.pop(k)
+        finished = sorted((j for j in JOBS.values() if j.status in ("done", "error")), key=lambda j: j.created)
+        old = [j for j in finished if j.created < cutoff]
+        surplus = finished[:max(0, len(finished) - settings.MAX_JOBS_KEPT)]
+        for job in {j.id: j for j in old + surplus}.values():
+            JOBS.pop(job.id, None)
             if job.pdf_path:
                 shutil.rmtree(os.path.dirname(job.pdf_path), ignore_errors=True)
 
@@ -74,7 +82,7 @@ def run_job(job: Job, path: str) -> None:
             # section images carry the lines only; the app shades fill/cut from
             # the profile so the picture follows the areas the user types
             res = process_plan_set(path, progress=progress, overlays="lines", name=job.filename,
-                                   workers=settings.WORKERS or None)
+                                   pool=PagePool.shared(settings.WORKERS or None))
             job.result = res
             job.payload = serialize(job, res)
             job.pdf_path = path
@@ -96,6 +104,15 @@ def start_job(name: str, path: str) -> Job:
         JOBS[job.id] = job
     threading.Thread(target=run_job, args=(job, path), daemon=True).start()
     return job
+
+
+def queue_position(job: Job) -> int | None:
+    """1 for the next queued job to start, None once it is running or over."""
+    if job.status != "queued":
+        return None
+    with LOCK:
+        waiting = sorted((j.created, j.id) for j in JOBS.values() if j.status == "queued")
+    return next((n for n, (_, jid) in enumerate(waiting, 1) if jid == job.id), None)
 
 
 def get_job(job_id: str) -> Job:

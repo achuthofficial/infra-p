@@ -1164,6 +1164,8 @@ small.req { color: var(--red-ink); font-size: 11px; }
 .stat-label { font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
 .stat-top .info-tip { margin-left: auto; }
 .stat-value { font-size: 30px; font-weight: 500; line-height: 1.2; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat-value.long { font-size: 24px; }
+.stat-value.xlong { font-size: 19px; }
 .stat-value small { font-size: 13px; font-weight: 400; color: var(--text-3); margin-left: 4px; letter-spacing: 0; }
 .stat-card.t-green .stat-value { color: var(--green-ink); }
 .stat-card.t-red .stat-value { color: var(--red-ink); }
@@ -1525,3 +1527,10 @@ tbody tr:hover { background: var(--surface-2); }
 }
 @media (max-width: 900px) { .page { padding: var(--sp-5) var(--sp-4) var(--sp-8); gap: var(--sp-5); } .navbar { padding: 0 var(--sp-4); } .hero { padding: var(--sp-6); } }
 @media (max-width: 640px) { .hero h2 { font-size: 22px; } .card { padding: var(--sp-5); } }
+
+/* progress: a notice such as "Reconnecting to the server…" */
+.progress-card .warning-note {
+  margin-top: 12px; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+  background: color-mix(in srgb, var(--yellow, #f9ab00) 14%, transparent); color: var(--text-1, inherit);
+}
+@media (max-width: 640px) { .stat-value.long { font-size: 19px; } .stat-value.xlong { font-size: 16px; } }
