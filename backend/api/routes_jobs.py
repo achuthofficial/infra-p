@@ -84,7 +84,8 @@ def complete_upload(upload_id: str):
 def get_job(job_id: str):
     job = jobs.get_job(job_id)
     body = {"job_id": job.id, "filename": job.filename, "status": job.status,
-            "progress": {"done": job.done, "total": job.total}, "error": job.error}
+            "progress": {"done": job.done, "total": job.total}, "error": job.error,
+            "queue_position": jobs.queue_position(job)}
     if job.status == "done":
         body["result"] = job.payload
     return body

@@ -139,7 +139,13 @@ def _base_image(doc: fitz.Document, page: fitz.Page) -> tuple[np.ndarray, dict] 
         pix = fitz.Pixmap(fitz.csRGB, pix)
     arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)
     if pix.n == 3:
-        arr = (arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114).astype(np.uint8)
+        # luminance in row blocks: the same arithmetic, without whole-page
+        # float64 temporaries (a 6000 x 4000 scan would briefly take ~600 MB)
+        rgb, arr = arr, np.empty(arr.shape[:2], np.uint8)
+        for r in range(0, rgb.shape[0], 256):
+            b = rgb[r:r + 256]
+            arr[r:r + 256] = (b[..., 0] * 0.299 + b[..., 1] * 0.587 + b[..., 2] * 0.114).astype(np.uint8)
+        del rgb
     else:
         arr = arr[..., 0].copy()
     # Respect the placement orientation: a portrait image placed on a

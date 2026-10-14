@@ -58,27 +58,45 @@ export default function App() {
     window.location.hash = jobId ? `/${view}/${jobId}` : `/${view}`;
   }, []);
 
-  const poll = useCallback((id) => {
+  // Poll a job until it is done. A failed check (a dropped connection, a busy
+  // or restarting server) is retried with a growing pause rather than ending
+  // the polling, so the progress never freezes; only an unknown job stops it.
+  const polling = useRef(null);
+  const poll = useCallback((id, failures = 0) => {
     clearTimeout(timer.current);
+    polling.current = id;
     getJob(id)
       .then((j) => {
+        if (polling.current !== id) return;           // another takeoff was opened meanwhile
         setJob(j);
+        setError(j.status === 'error' ? (j.error || 'Processing failed.') : null);
         if (j.status === 'queued' || j.status === 'running') {
-          timer.current = setTimeout(() => poll(id), 800);
-        } else if (j.status === 'error') {
-          setError(j.error || 'Processing failed.');
+          timer.current = setTimeout(() => poll(id), j.status === 'queued' ? 2000 : 1000);
+        } else {
+          polling.current = null;
         }
       })
       .catch((e) => {
-        setError(e.message);
-        setJob(null);
+        if (polling.current !== id) return;
+        if (e.status === 404) {
+          polling.current = null;
+          setJob(null);
+          setError('This takeoff is no longer on the server (results are cleared when the app restarts or '
+            + 'after some hours). Upload the plan set again.');
+          return;
+        }
+        setError(failures >= 2 ? 'Reconnecting to the server…' : null);
+        timer.current = setTimeout(() => poll(id, failures + 1), Math.min(10000, 1000 * 2 ** failures));
       });
   }, []);
 
-  // open the job named in the URL (on load, or when a link is followed)
+  // open the job named in the URL (on load, or when a link is followed), and
+  // pick polling back up when coming back to an unfinished one
   useEffect(() => {
-    if (route.jobId && route.jobId !== job?.job_id) poll(route.jobId);
-  }, [route.jobId, job?.job_id, poll]);
+    if (!route.jobId) return;
+    const unfinished = job && job.job_id === route.jobId && (job.status === 'queued' || job.status === 'running');
+    if (route.jobId !== job?.job_id || (unfinished && polling.current !== route.jobId)) poll(route.jobId);
+  }, [route.jobId, job?.job_id, job?.status, poll]);
 
   useEffect(() => () => clearTimeout(timer.current), []);
 
@@ -104,7 +122,7 @@ export default function App() {
   let page;
   if (view === 'results') {
     page = done ? <Results key={done.job_id} result={done.result} onResult={(r) => setJob((j) => ({ ...j, result: r }))} />
-      : running ? <ProgressView job={running} />
+      : running ? <ProgressView job={running} notice={error} />
       : (
         <div className="page-empty">
           <h2>No takeoff open</h2>

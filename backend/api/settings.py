@@ -19,11 +19,12 @@ def env_list(value: str | None) -> list[str]:
 
 
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", 6 * 3600))
-# each job already runs its pages in parallel on all cores; more jobs at once
-# would only slow every one of them down, so further uploads wait their turn
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", 1))
-# processes a job reads its pages with; 0 = min(4, CPUs). Each holds a rendered
-# page (~200 MB on big scans), so on a small instance set it to 1 or 2
+MAX_JOBS_KEPT = int(os.environ.get("MAX_JOBS_KEPT", 20))     # finished jobs kept in memory, newest first
+# plan sets processed at once; they share the WORKERS page processes fairly,
+# so several people's uploads all make progress; any more wait in a queue
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", 4))
+# page-reading processes for the whole server; 0 = fit the container's CPUs and
+# memory (gdot_earthwork.pool.default_workers: ~0.6 GB each on large scans)
 WORKERS = int(os.environ.get("WORKERS", 0))
 # Scanned plan sets are big (the dataset's largest is ~120 MB); the cap only
 # guards the disk. Uploads arrive in chunks (see /api/uploads), so proxies with

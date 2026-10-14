@@ -64,7 +64,11 @@ export function StatCard({ icon: Icon, tone = 'blue', label, value, unit, tip, c
         <span className="stat-label">{label}</span>
         {tip && <InfoTip label={`About ${typeof label === 'string' ? label.toLowerCase() : 'this figure'}`}>{tip}</InfoTip>}
       </div>
-      <div className="stat-value num">{value}{unit && <small>{unit}</small>}</div>
+      {/* big numbers (a 6-digit net volume) step the size down instead of being cut off */}
+      <div className={`stat-value num${String(value).length > 9 ? ' xlong' : String(value).length > 6 ? ' long' : ''}`}
+        title={typeof value === 'string' || typeof value === 'number' ? `${value}${unit ? ` ${unit}` : ''}` : undefined}>
+        {value}{unit && <small>{unit}</small>}
+      </div>
       {children}
     </div>
   );

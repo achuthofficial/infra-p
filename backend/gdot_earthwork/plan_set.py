@@ -21,7 +21,8 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -29,6 +30,7 @@ import pymupdf as fitz
 
 from .confidence import score_sections
 from .config import PipelineConfig, get_config
+from .pool import PagePool
 from .render import encode_png, overlay, overlay_scale, profile
 from .roads import Road, StationEntry, group_into_roads
 from .sides import measured_sides
@@ -235,10 +237,13 @@ def process_plan_set(
     progress: Callable[[int, int], None] | None = None,
     pages: list[int] | None = None,
     name: str | None = None,
+    pool: PagePool | None = None,
 ) -> PlanSetResult:
     """`pages`: 1-based page numbers to process (default: every page).
     `name`: the plan set's original file name (default: the PDF's); a name
-    naming a stage ("... STAGE 3.pdf") turns on staged-sheet handling."""
+    naming a stage ("... STAGE 3.pdf") turns on staged-sheet handling.
+    `pool`: worker processes shared with other jobs (pool.PagePool); without
+    one, `workers` processes are started for this plan set alone."""
     name = name or os.path.basename(pdf_path)
     if cfg is None or isinstance(cfg, str):
         cfg = get_config(cfg or "auto")
@@ -246,28 +251,27 @@ def process_plan_set(
     with fitz.open(pdf_path) as doc:
         n_pages = len(doc)
     todo = [p - 1 for p in (pages or range(1, n_pages + 1)) if 1 <= p <= n_pages]
-    workers = workers or min(4, os.cpu_count() or 1)
-
-    by_page: dict[int, list[SectionResult]] = {}
-    done = 0
-    if workers > 1 and len(todo) > 1:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_measure_page, pdf_path, i, cfg, overlays, name): i for i in todo}
-            for fut in as_completed(futs):
-                by_page[futs[fut] + 1] = fut.result()
-                done += 1
-                if progress:
-                    progress(done, len(todo))
+    workers = pool.workers if pool else (workers or min(4, os.cpu_count() or 1))
+    page_warnings: list[str] = []
+    if pool is not None or (workers > 1 and len(todo) > 1):
+        own = pool is None
+        pool = pool or PagePool(workers)
+        try:
+            with pool.job():
+                by_page = _read_pages(pool, todo, (pdf_path, cfg, overlays, name), progress, page_warnings)
+        finally:
+            if own:
+                pool.close()
     else:
-        for i in todo:
+        by_page = {}
+        for n, i in enumerate(todo, 1):
             by_page[i + 1] = _measure_page(pdf_path, i, cfg, overlays, name)
-            done += 1
             if progress:
-                progress(done, len(todo))
+                progress(n, len(todo))
     t_pages = time.time() - t0
 
     sections = _document_order(by_page)
-    warnings = decode_stations(sections)
+    warnings = page_warnings + decode_stations(sections)
 
     _place_centrelines(sections)
 
@@ -292,6 +296,48 @@ def process_plan_set(
         sections=sections, roads=roads, volumes=volumes, alt_volumes=alt_volumes,
         warnings=warnings, timing=timing, design_surface=cfg.design_surface,
     )
+
+
+def _read_pages(pool: PagePool, todo: list[int], args: tuple, progress, warnings: list[str],
+                retries: int = 2, read=None) -> dict[int, list[SectionResult]]:
+    """Read the pages on the pool, keeping at most this job's share of the
+    workers busy. A page whose worker died (the executor breaks for every job
+    using it) is tried again on a fresh one, up to `retries` times; a page
+    that fails is left out with a warning rather than failing the plan set.
+    `read(pdf, page_index, *rest)`: what reads a page (default _measure_page)."""
+    read = read or _measure_page
+    pending, inflight, tries, out = list(todo), {}, {}, {}
+    total, done = len(todo), 0
+    while pending or inflight:
+        ex = pool.executor()
+        try:
+            while pending and len(inflight) < pool.share():
+                i = pending.pop(0)
+                inflight[ex.submit(read, args[0], i, *args[1:])] = (i, ex)
+        except BrokenProcessPool:
+            pending.insert(0, i)
+            pool.restart(ex)
+            continue
+        finished, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+        for fut in finished:
+            i, used = inflight.pop(fut)
+            try:
+                out[i + 1] = fut.result()
+            except BrokenProcessPool:
+                pool.restart(used)
+                tries[i] = tries.get(i, 0) + 1
+                if tries[i] <= retries:
+                    pending.insert(0, i)
+                    continue
+                out[i + 1] = []
+                warnings.append(f"page {i + 1} could not be read: its worker ran out of memory or was stopped")
+            except Exception as e:  # one unreadable page doesn't sink the plan set
+                out[i + 1] = []
+                warnings.append(f"page {i + 1} could not be read ({type(e).__name__}: {e})")
+            done += 1
+            if progress:
+                progress(done, total)
+    return out
 
 
 def _place_centrelines(sections: list[SectionResult]) -> None:

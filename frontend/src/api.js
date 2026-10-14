@@ -4,7 +4,11 @@ const BASE = import.meta.env.VITE_API_BASE || '';
 
 async function json(res) {
   const body = await res.json().catch(() => null);
-  if (!res.ok) throw new Error((body && body.detail) || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const e = new Error((body && body.detail) || `Request failed (${res.status})`);
+    e.status = res.status;
+    throw e;
+  }
   return body;
 }
 

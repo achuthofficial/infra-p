@@ -9,7 +9,7 @@ const STEPS = [
   { Icon: IconLayers, label: 'Measure', tip: 'Measuring cut / fill and grouping stations into roads' },
 ];
 
-export default function ProgressView({ job }) {
+export default function ProgressView({ job, notice }) {
   const [start] = useState(() => Date.now());
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -36,9 +36,12 @@ export default function ProgressView({ job }) {
         </div>
         <div className="chips">
           <span className="tag neutral"><IconSheet width={14} height={14} />
-            {job.status === 'queued' ? 'waiting for another plan set' : total ? `${done} / ${total} pages` : 'starting'}</span>
+            {job.status === 'queued'
+              ? (job.queue_position ? `#${job.queue_position} in line` : 'waiting for a free slot')
+              : total ? `${done} / ${total} pages` : 'starting'}</span>
           <span className="tag neutral"><IconClock width={14} height={14} />{secs}s</span>
         </div>
+        {notice && <div className="note warning-note" role="status">{notice}</div>}
         <ul className="steps-row" aria-label="What happens">
           {STEPS.map(({ Icon, label, tip }) => (
             <li key={label} title={tip}><Icon width={18} height={18} /><span>{label}</span><span className="sr-only">: {tip}</span></li>
