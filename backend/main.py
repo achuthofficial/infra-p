@@ -75,6 +75,7 @@ app = FastAPI(title="Earthwork Takeoff API", version=__version__)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origin_regex=settings.ALLOWED_ORIGIN_REGEX,
     allow_methods=["GET", "POST", "PUT"],
     allow_headers=["*"],
     expose_headers=["X-Job-Id", "Location", "Content-Location", "Retry-After"],

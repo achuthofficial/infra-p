@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { getOpenApi, V1, v1Request } from '../api';
+import { API_ORIGIN, getOpenApi, V1, v1Request } from '../api';
 import {
   IconAlert, IconArrow, IconChevron, IconCode, IconCopy, IconExternal, IconFile, IconKey, IconPlay, IconUpload,
 } from './Icons';
@@ -222,7 +222,7 @@ function Reference({ endpoint, apiKey, jobId, surface }) {
   }, []);
   useEffect(() => store('api.lang', lang), [lang]);
 
-  const base = `${window.location.origin}${V1}`;
+  const base = `${API_ORIGIN}${V1}`;
   const code = useMemo(() => samples({ base, endpoint, apiKey, jobId, surface }), [base, endpoint, apiKey, jobId, surface]);
   const ops = operations(spec, endpoint) || (specError ? FALLBACK(endpoint) : null);
   const resultSchema = endpoint === 'calibration' ? 'Calibration' : 'CrossSections';

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { createJob, getCalibration, getCrossSections, getJob, getSchema } from '../api';
+import { API_ORIGIN, createJob, getCalibration, getCrossSections, getJob, getSchema } from '../api';
 import { IconCopy, IconDownload, IconFile, IconRuler, IconUpload } from './Icons';
 import JsonView, { pretty } from './JsonView';
 import { Disclosure, InfoTip, Meter } from './Ui';
@@ -135,8 +135,7 @@ export default function CalibrationView({ openJob }) {
     return () => { alive.current = false; };
   }, []);
 
-  const origin = window.location.origin;
-  const samples = useMemo(() => codeSamples(origin), [origin]);
+  const samples = useMemo(() => codeSamples(API_ORIGIN), []);
   const busy = phase === 'uploading' || phase === 'processing' || phase === 'calibrating';
 
   async function calibrate(jobId) {
