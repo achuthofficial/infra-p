@@ -83,14 +83,19 @@ def _digest(key: str) -> bytes:
     return hashlib.sha256(key.encode()).digest()
 
 
-def require_api_key(key: Annotated[str | None, Security(api_key_header)] = None) -> None:
-    """With API_KEYS set, X-API-Key must be one of them. Digests are compared
-    with hmac.compare_digest against every key, every time, so the timing
-    tells nothing about a key's content, its length or which one matched."""
+def key_ok(key: str | None) -> bool:
+    """True when API_KEYS is unset, or `key` is one of them. Digests are
+    compared with hmac.compare_digest against every key, every time, so the
+    timing tells nothing about a key's content, its length or which one matched."""
     if not settings.API_KEYS:
-        return
+        return True
     given = _digest(key or "")
-    if not any([hmac.compare_digest(given, _digest(k)) for k in settings.API_KEYS]):
+    return any([hmac.compare_digest(given, _digest(k)) for k in settings.API_KEYS])
+
+
+def require_api_key(key: Annotated[str | None, Security(api_key_header)] = None) -> None:
+    """With API_KEYS set, X-API-Key must be one of them."""
+    if not key_ok(key):
         raise HTTPException(401, "Missing or invalid API key: send one in the X-API-Key header.",
                             headers={"WWW-Authenticate": "APIKey"})
 

@@ -314,3 +314,24 @@ def test_cors_from_vercel(client):
         assert r.status_code == 200 and r.headers["access-control-allow-origin"] == origin
     r = client.get("/api/health", headers={"Origin": "https://evil.vercel.app.example"})
     assert "access-control-allow-origin" not in r.headers
+
+
+def test_app_endpoints_need_the_key_when_set(client, monkeypatch):
+    # with API_KEYS set the app's own endpoints are closed too (header, or
+    # ?api_key= for images and downloads); the health check stays open
+    monkeypatch.setattr(settings, "API_KEYS", ("k1",))
+    assert client.get("/api/health").status_code == 200
+    r = client.post("/api/uploads", json={"filename": "x.pdf", "size": 10})
+    assert r.status_code == 401 and "X-API-Key" in r.json()["detail"]
+    assert client.get("/api/accuracy", headers={"X-API-Key": "nope"}).status_code == 401
+    assert client.post("/api/uploads", json={"filename": "x.pdf", "size": 10},
+                       headers={"X-API-Key": "k1"}).status_code == 200
+    assert client.get("/api/jobs/abc/sections.csv?api_key=k1").status_code == 404     # past the key check
+    assert client.get("/api/v1/calibration/abc").status_code == 401                    # the public API, as before
+    # a browser on the app's origin can still read the 401
+    origin = settings.ALLOWED_ORIGINS[0]
+    r = client.get("/api/accuracy", headers={"Origin": origin})
+    assert r.status_code == 401 and r.headers["access-control-allow-origin"] == origin
+    r = client.options("/api/uploads", headers={
+        "Origin": origin, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "x-api-key"})
+    assert r.status_code == 200

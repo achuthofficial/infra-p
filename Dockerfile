@@ -5,7 +5,10 @@ WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
-# empty API base: the app is served by the API itself (same origin)
+# empty API base: the app is served by the API itself (same origin). With
+# API_KEYS on the server, pass one at build time (--build-arg VITE_API_KEY=...)
+# so the app this image serves can call its own API.
+ARG VITE_API_KEY=
 RUN VITE_API_BASE= npm run build
 
 FROM python:3.12-slim
