@@ -33,6 +33,11 @@ UPLOAD_CHUNK_MB = int(os.environ.get("UPLOAD_CHUNK_MB", 8))
 UPLOAD_TTL_SECONDS = 3600               # an unfinished chunked upload is dropped after this
 ALLOWED_ORIGINS = env_list(os.environ.get(
     "ALLOWED_ORIGINS", "http://localhost:5173,https://improved-space-journey-w4rrv6rx5w6cgxxv-5173.app.github.dev"))
+# Origins matching this may call the API too: by default every Vercel
+# deployment (production and each preview URL) of the separately hosted
+# frontend. The API sends no cookies, so this only lets those pages read it.
+# Empty turns it off.
+ALLOWED_ORIGIN_REGEX = os.environ.get("ALLOWED_ORIGIN_REGEX", r"https://[a-z0-9-]+\.vercel\.app") or None
 # Keys for the public API (/api/v1), sent as X-API-Key. Unset or empty leaves
 # it open; the app's own /api endpoints never ask for one.
 API_KEYS = tuple(env_list(os.environ.get("API_KEYS")))

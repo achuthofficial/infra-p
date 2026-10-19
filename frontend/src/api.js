@@ -1,6 +1,11 @@
-// All endpoints are relative: Vite proxies /api in development and the
-// backend serves this app itself in production.
-const BASE = import.meta.env.VITE_API_BASE || '';
+// Where the API lives. Empty = this page's own origin: Vite proxies /api in
+// development, and the Docker image serves the app and the API together.
+// A frontend hosted on its own (Vercel) gets the backend's URL from
+// VITE_API_BASE (.env.production), and calls it cross-origin (CORS).
+const BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/+$/, '');
+
+/** The API's origin, for code samples a user copies and runs elsewhere. */
+export const API_ORIGIN = BASE || window.location.origin;
 
 async function json(res) {
   const body = await res.json().catch(() => null);

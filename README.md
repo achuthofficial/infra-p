@@ -54,6 +54,37 @@ Optional variables (**Variables** tab):
 Jobs are kept in memory and temp files, so a redeploy clears them; plan sets
 are simply uploaded again.
 
+## Deploy on Cloud Run (API) + Vercel (app)
+
+The API runs on Cloud Run at `https://infra-p-172025772606.us-central1.run.app`;
+the app on Vercel calls it directly (`frontend/.env.production` sets
+`VITE_API_BASE`, and the API allows every `*.vercel.app` origin by default,
+previews included; change it with `ALLOWED_ORIGIN_REGEX`).
+
+**Vercel**: import the repo, set **Root Directory** to `frontend` (framework
+Vite, settings come from `frontend/vercel.json`). To point at another backend,
+set `VITE_API_BASE` in the project's environment variables and redeploy.
+
+**Cloud Run**: jobs live in the memory of the instance that received the
+upload and keep processing after the upload request returns, so for several
+users at once the service needs one instance that is always on, with CPU
+always allocated:
+
+```bash
+gcloud run deploy infra-p --source . --region us-central1 --allow-unauthenticated \
+  --min-instances 1 --max-instances 1 --no-cpu-throttling \
+  --cpu 4 --memory 8Gi --timeout 3600 --concurrency 80 \
+  --set-env-vars MAX_CONCURRENT_JOBS=2,WORKERS=2
+```
+
+* `--max-instances 1`: a second instance would not know the first one's jobs
+  (uploads and polls would randomly 404).
+* `--min-instances 1` and `--no-cpu-throttling`: jobs aren't wiped by scaling
+  to zero, and keep running between the browser's polls.
+* `MAX_CONCURRENT_JOBS` jobs run at once, each with `WORKERS` processes; the
+  rest wait as *queued*. Keep `MAX_CONCURRENT_JOBS × WORKERS` near the CPU count
+  and about 1 GB of memory per worker.
+
 ## Use it
 
 * **New takeoff**: upload the PDF. **Results** then shows every section (traced

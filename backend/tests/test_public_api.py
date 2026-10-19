@@ -304,3 +304,13 @@ def test_cors_as_the_app(client):
     assert r.status_code == 200 and r.headers["access-control-allow-origin"] == origin
     r = client.get("/api/v1/schemas/calibration", headers={"Origin": "https://elsewhere.example"})
     assert "access-control-allow-origin" not in r.headers
+
+
+def test_cors_from_vercel(client):
+    # the frontend hosted on Vercel: production and preview deployments alike
+    for origin in ("https://infra-p.vercel.app", "https://infra-p-git-main-someone.vercel.app"):
+        r = client.options("/api/uploads", headers={
+            "Origin": origin, "Access-Control-Request-Method": "PUT", "Access-Control-Request-Headers": "content-type"})
+        assert r.status_code == 200 and r.headers["access-control-allow-origin"] == origin
+    r = client.get("/api/health", headers={"Origin": "https://evil.vercel.app.example"})
+    assert "access-control-allow-origin" not in r.headers

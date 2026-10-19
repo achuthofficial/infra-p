@@ -5,7 +5,8 @@ WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
-RUN npm run build
+# empty API base: the app is served by the API itself (same origin)
+RUN VITE_API_BASE= npm run build
 
 FROM python:3.12-slim
 # tesseract reads station labels on scanned sheets
