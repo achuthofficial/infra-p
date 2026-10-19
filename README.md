@@ -46,7 +46,7 @@ Optional variables (**Variables** tab):
 
 | Variable | Default | |
 |---|---|---|
-| `API_KEYS` | unset (open) | comma-separated keys required as `X-API-Key` on `/api/v1` |
+| `API_KEYS` | unset (open) | comma-separated keys required as `X-API-Key` on every `/api` endpoint but `/api/health` |
 | `WORKERS` | min(4, CPUs) | processes per job; use 1–2 on instances with under 4 GB RAM |
 | `MAX_UPLOAD_MB` | 2048 | largest PDF accepted |
 | `JOB_TTL_SECONDS` | 21600 | how long results stay available |
@@ -64,6 +64,12 @@ previews included; change it with `ALLOWED_ORIGIN_REGEX`).
 **Vercel**: import the repo, set **Root Directory** to `frontend` (framework
 Vite, settings come from `frontend/vercel.json`). To point at another backend,
 set `VITE_API_BASE` in the project's environment variables and redeploy.
+
+**API key**: with `API_KEYS` set on Cloud Run, every `/api` request needs one of
+the keys in an `X-API-Key` header (images and downloads send it as `?api_key=`);
+only `/api/health` stays open. Give the app the key as `VITE_API_KEY` in Vercel →
+Settings → Environment Variables, then redeploy. Never commit it: this
+repository is public (`frontend/.env.example` lists the variables).
 
 **Cloud Run**: jobs live in the memory of the instance that received the
 upload and keep processing after the upload request returns, so for several

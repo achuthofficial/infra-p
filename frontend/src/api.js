@@ -7,6 +7,21 @@ const BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/+$/, '');
 /** The API's origin, for code samples a user copies and runs elsewhere. */
 export const API_ORIGIN = BASE || window.location.origin;
 
+// The backend's API key (VITE_API_KEY, set in the hosting platform's
+// environment, never committed), sent as X-API-Key on every request. Images
+// and downloads are plain links that cannot carry a header: they get it as
+// ?api_key= instead (see withKey).
+const KEY = import.meta.env.VITE_API_KEY || '';
+const KEY_HEADER = KEY ? { 'X-API-Key': KEY } : {};
+
+function call(url, opts = {}) {
+  return fetch(url, { ...opts, headers: { ...KEY_HEADER, ...opts.headers } });
+}
+
+function withKey(url) {
+  return KEY ? `${url}${url.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(KEY)}` : url;
+}
+
 async function json(res) {
   const body = await res.json().catch(() => null);
   if (!res.ok) throw new Error((body && body.detail) || `Request failed (${res.status})`);
@@ -14,11 +29,11 @@ async function json(res) {
 }
 
 export async function health() {
-  return json(await fetch(`${BASE}/api/health`));
+  return json(await call(`${BASE}/api/health`));
 }
 
 export async function getAccuracy() {
-  return json(await fetch(`${BASE}/api/accuracy`));
+  return json(await call(`${BASE}/api/accuracy`));
 }
 
 // One XMLHttpRequest (fetch cannot report upload progress). Resolves with
@@ -27,7 +42,7 @@ function send(method, url, payload, headers, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open(method, url);
-    Object.entries(headers || {}).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    Object.entries({ ...KEY_HEADER, ...headers }).forEach(([k, v]) => xhr.setRequestHeader(k, v));
     if (onProgress) xhr.upload.onprogress = (e) => onProgress(e.loaded);
     xhr.onerror = () => reject(new Error('network'));
     xhr.onload = () => {
@@ -92,14 +107,14 @@ export async function createJob(file, onProgress) {
 }
 
 export async function getJob(id) {
-  return json(await fetch(`${BASE}/api/jobs/${id}`));
+  return json(await call(`${BASE}/api/jobs/${id}`));
 }
 
 /** Save hand-edited areas for one surface. `edits` maps section id ->
  * {fill_ft2, cut_ft2}, or null to go back to the measured areas.
  * Returns the updated result (volumes recomputed by the server). */
 export async function saveEdits(jobId, surface, edits) {
-  return json(await fetch(`${BASE}/api/jobs/${jobId}/edits`, {
+  return json(await call(`${BASE}/api/jobs/${jobId}/edits`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ surface, edits }),
@@ -111,7 +126,7 @@ const profiles = new Map();
 /** A section's traced lines in its image's pixels (cached: they never change). */
 export function getProfile(path) {
   if (!profiles.has(path)) {
-    const p = fetch(assetUrl(path)).then((r) => {
+    const p = call(assetUrl(path)).then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
     });
@@ -123,27 +138,27 @@ export function getProfile(path) {
 
 /** Feet-to-pixel calibration per sheet, and the cut / fill shapes, for a finished job. */
 export async function getCalibration(jobId) {
-  return json(await fetch(`${BASE}/api/jobs/${jobId}/calibration`));
+  return json(await call(`${BASE}/api/jobs/${jobId}/calibration`));
 }
 
 /** Every cross-section in the received format: left / right areas, shapes, confidence and alerts. */
 export async function getCrossSections(jobId, surface) {
   const q = surface ? `?surface=${encodeURIComponent(surface)}` : '';
-  return json(await fetch(`${BASE}/api/jobs/${jobId}/cross-sections${q}`));
+  return json(await call(`${BASE}/api/jobs/${jobId}/cross-sections${q}`));
 }
 
 /** A JSON Schema the API's responses are validated against ("calibration", "cross-sections"). */
 export async function getSchema(name) {
-  return json(await fetch(`${BASE}/api/schemas/${name}`));
+  return json(await call(`${BASE}/api/schemas/${name}`));
 }
 
 /** Stored comparisons with results provided for a plan set (e.g. SR 5). */
 export async function listComparisons() {
-  return json(await fetch(`${BASE}/api/comparisons`));
+  return json(await call(`${BASE}/api/comparisons`));
 }
 
 export async function getComparison(name) {
-  return json(await fetch(`${BASE}/api/comparisons/${name}`));
+  return json(await call(`${BASE}/api/comparisons/${name}`));
 }
 
 /** Compare an open takeoff with a provided results file (xlsx / csv). */
@@ -151,30 +166,30 @@ export async function compareJob(jobId, file, surface) {
   const form = new FormData();
   form.append('file', file);
   const q = surface ? `?surface=${encodeURIComponent(surface)}` : '';
-  return json(await fetch(`${BASE}/api/jobs/${jobId}/compare${q}`, { method: 'POST', body: form }));
+  return json(await call(`${BASE}/api/jobs/${jobId}/compare${q}`, { method: 'POST', body: form }));
 }
 
 /** A sheet's measured sections, in the sheet image's coordinates (cached). */
 export const getSheet = (jobId, page) => getProfile(`/api/jobs/${jobId}/pages/${page}.json`);
 
 export function assetUrl(path) {
-  return `${BASE}${path}`;
+  return withKey(`${BASE}${path}`);
 }
 
 export function volumesCsvUrl(jobId, excludedRoadIds, surface) {
   const q = excludedRoadIds.map((id) => `exclude=${encodeURIComponent(id)}`);
   if (surface) q.push(`surface=${encodeURIComponent(surface)}`);
-  return `${BASE}/api/jobs/${jobId}/volumes.csv${q.length ? `?${q.join('&')}` : ''}`;
+  return withKey(`${BASE}/api/jobs/${jobId}/volumes.csv${q.length ? `?${q.join('&')}` : ''}`);
 }
 
 export function annotatedPdfUrl(jobId, excludedRoadIds, surface) {
   const q = excludedRoadIds.map((id) => `exclude=${encodeURIComponent(id)}`);
   if (surface) q.push(`surface=${encodeURIComponent(surface)}`);
-  return `${BASE}/api/jobs/${jobId}/annotated.pdf${q.length ? `?${q.join('&')}` : ''}`;
+  return withKey(`${BASE}/api/jobs/${jobId}/annotated.pdf${q.length ? `?${q.join('&')}` : ''}`);
 }
 
 export function sectionsCsvUrl(jobId) {
-  return `${BASE}/api/jobs/${jobId}/sections.csv`;
+  return withKey(`${BASE}/api/jobs/${jobId}/sections.csv`);
 }
 
 // ---------------------------------------------------------------- public API v1
@@ -201,7 +216,7 @@ export function v1Request(method, path, { form, apiKey, signal, onUpload } = {})
     const started = performance.now();
     xhr.open(method, `${BASE}${V1}${path}`);
     xhr.setRequestHeader('Accept', 'application/json');
-    if (apiKey) xhr.setRequestHeader('X-API-Key', apiKey);
+    if (apiKey || KEY) xhr.setRequestHeader('X-API-Key', apiKey || KEY);
     if (onUpload) xhr.upload.onprogress = (e) => onUpload(e.loaded, e.total);
     xhr.onerror = () => reject(new Error('The server could not be reached.'));
     xhr.onabort = () => reject(Object.assign(new Error('Cancelled.'), { name: 'AbortError' }));
@@ -221,5 +236,5 @@ export function v1Request(method, path, { form, apiKey, signal, onUpload } = {})
 
 /** The public API's OpenAPI document. */
 export async function getOpenApi() {
-  return json(await fetch(`${BASE}${V1}/openapi.json`));
+  return json(await call(`${BASE}${V1}/openapi.json`));
 }

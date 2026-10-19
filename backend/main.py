@@ -45,9 +45,9 @@ import os
 import sys
 import types
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from api import (
@@ -70,6 +70,25 @@ from gdot_earthwork import __version__
 __all__ = ["app", "JOBS", "Job", "_recompute_volumes", "section_sides", "serialize"]
 
 app = FastAPI(title="Earthwork Takeoff API", version=__version__)
+OPEN_PATHS = {"/api/health"}
+
+
+# With API_KEYS set, the app's own endpoints need a key too, not just the
+# public API (which checks X-API-Key itself): otherwise anyone could upload and
+# keep the CPUs busy. Images and downloads are plain links that cannot carry a
+# header, so ?api_key= is accepted as well. The health check stays open for
+# the host. Registered before CORS, so CORS stays outermost: preflights are
+# answered and a 401 still carries the CORS headers the browser needs to read it.
+@app.middleware("http")
+async def require_key(request: Request, call_next):
+    path = request.url.path
+    if (path.startswith("/api/") and not path.startswith("/api/v1/") and path not in OPEN_PATHS
+            and not public.key_ok(request.headers.get("x-api-key") or request.query_params.get("api_key"))):
+        return JSONResponse({"detail": "Missing or invalid API key: send one in the X-API-Key header."},
+                            status_code=401, headers={"WWW-Authenticate": "APIKey"})
+    return await call_next(request)
+
+
 # also covers the public API mounted below: the same origins may call it, and
 # read the headers it answers with (the job id, where to poll, when)
 app.add_middleware(
