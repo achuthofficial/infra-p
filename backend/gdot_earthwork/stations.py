@@ -84,11 +84,11 @@ def _options(r: StationRead) -> list[tuple[float | None, str | None, float]]:
     for ft, (_, label, score) in list(opts.items()):
         if any(_drops_one_digit(label, other) for other in readings):
             opts[ft] = (ft, label, score + _FULLER_BONUS)
-    # OCR's typical slips on these fonts are single-character ones at the
-    # front of the label or right before the plus sign: a dropped or
-    # misread leading digit ("72+50" -> "12+50", "175+50" -> "75+50") or an
-    # extra digit ("301+50" -> "3014+50"). Those edits are offered at a low
-    # score, so a clean sequence can win the right reading back.
+    # OCR's typical slips on these fonts are single-character ones before
+    # the plus sign: a dropped or misread digit ("72+50" -> "12+50",
+    # "175+50" -> "75+50", "108+00" -> "198+00") or an extra one ("301+50"
+    # -> "3014+50"). Those edits are offered at a low score, so a clean
+    # sequence can win the right reading back.
     for c in [r.label, *r.candidates]:
         for fixed in _single_edits(c):
             ft = parse_station(fixed)
@@ -113,10 +113,19 @@ def _single_edits(label: str | None) -> list[str]:
     heads |= {d + head for d in "123456789"}                   # dropped leading digit
     if len(head) >= 2:
         heads.add(head[1:])                                    # spurious leading digit
-    heads |= {d + head[1:] for d in "0123456789" if d != head[0] and (d != "0" or len(head) == 1)}
+    heads |= {head[:i] + d + head[i + 1:] for i in range(len(head)) for d in "0123456789"
+              if d != head[i]}                                  # a misread digit ("198" for "108", "38" for "39")
     heads |= {head[:i] + d + head[i:] for i in range(1, len(head) + 1) for d in "0123456789"}   # dropped digit
     # a station never starts with 0 (except "0+50")
-    return [f"{h}+{tail}" for h in sorted(heads) if h and (h == "0" or not h.startswith("0"))]
+    out = [f"{h}+{tail}" for h in sorted(heads) if h and (h == "0" or not h.startswith("0"))]
+    # a misread digit after the plus ("213+30" for "213+50"), to the 25 ft
+    # stations sections are cut at -- an odd one (26+40) is read as it is,
+    # never made up to fit a step
+    whole, dot, dec = tail.partition(".")
+    if len(whole) == 2 and whole.isdigit() and not dec.strip("0"):
+        out += [f"{head}+{t}{dot}{dec}" for t in ("00", "25", "50", "75")
+                if t != whole and sum(a != b for a, b in zip(t, whole)) == 1]
+    return out
 
 
 def _transition(a: float, b: float, expected: float, step: float) -> float:
