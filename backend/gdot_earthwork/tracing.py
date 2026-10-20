@@ -89,15 +89,42 @@ def strip_grid(ink: np.ndarray, V, H_, bridge: int = 5, sliver: int = 0) -> np.n
         a, b = s - 1, e + 1
         if a < 0 or b >= m.shape[1]:
             continue
-        both = dilate1d(m[:, a].astype(bool), bridge) & dilate1d(m[:, b].astype(bool), bridge)
+        both = _bridged(m[:, a].astype(bool), m[:, b].astype(bool), bridge)
         m[:, a + 1:b] |= both[:, None].astype(np.uint8)
     for s, e in H_:
         a, b = s - 1, e + 1
         if a < 0 or b >= m.shape[0]:
             continue
-        both = dilate1d(m[a, :].astype(bool), bridge) & dilate1d(m[b, :].astype(bool), bridge)
+        both = _bridged(m[a, :].astype(bool), m[b, :].astype(bool), bridge)
         m[a + 1:b, :] |= both[None, :].astype(np.uint8)
     return m
+
+
+def _bridged(a: np.ndarray, b: np.ndarray, bridge: int) -> np.ndarray:
+    """Where to carry ink across an erased grid band, given the ink on its
+    two sides. Each line crossing the band is a run of ink on either side;
+    a run is joined to the run it touches on the other side, or else to its
+    nearest one there within `bridge` when that one's nearest is it in turn,
+    across their overlap, or the gap between them. Filling everything near
+    ink on both sides instead would also fill the span between two lines
+    crossing the band close together (ground passing by the template) and
+    weld them into one stroke."""
+    out = np.zeros_like(a)
+    ra, rb = np.array(runs1d(np.flatnonzero(a), tol=1)), np.array(runs1d(np.flatnonzero(b), tol=1))
+    if not len(ra) or not len(rb):
+        return out
+    hi_start = np.maximum(ra[:, None, 0], rb[None, :, 0])
+    lo_end = np.minimum(ra[:, None, 1], rb[None, :, 1])
+    gap = hi_start - lo_end - 1                 # < 0: the runs overlap
+    na, nb = gap.argmin(axis=1), gap.argmin(axis=0)
+    join = gap <= 0
+    i = np.arange(len(ra))
+    mutual = (nb[na] == i) & (gap[i, na] <= bridge)
+    join[i[mutual], na[mutual]] = True
+    for i, j in zip(*np.nonzero(join)):
+        lo, hi = sorted((hi_start[i, j], lo_end[i, j]))
+        out[lo:hi + 1] = True
+    return out
 
 
 def denoise(roi: np.ndarray) -> tuple[np.ndarray, int]:
