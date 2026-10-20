@@ -25,6 +25,8 @@ class SectionSpec:
     design: list[tuple[float, float]]
     pavement: list[tuple[float, float, float]] = field(default_factory=list)  # existing asphalt: (from, to, thick ft)
     poles: list[float] = field(default_factory=list)                          # utility poles standing on the ground
+    pole_style: str = "line"     # "line": an upright with a cross arm; "box": a 1 ft box carried 6 ft into the
+                                 # ground, with a cross arm and a down guy anchored 12 ft to the right
     stage_mark: tuple[str, float, float] | None = None   # ("2", from, to): a "STAGE 2 CONSTRUCTION" dimension
 
 
@@ -92,6 +94,27 @@ def walled_cut(station: str, ground_elev: float, depth: float, wall_at: float = 
     return SectionSpec(station, g, d)
 
 
+def fill_wall(station: str, ground_elev: float, height: float, wall_at: float = 24.0) -> SectionSpec:
+    """A road on fill held by a vertical wall on the right: the roadway runs
+    flat to the wall's top, the face drops straight to the ground."""
+    g = [(-140, ground_elev), (-40, ground_elev + 0.4), (40, ground_elev - 0.3), (140, ground_elev - 0.5)]
+    top = ground_elev + height
+    foot = float(_interp(g, wall_at))
+    toe = -18 - 2 * height
+    d = [(toe, float(_interp(g, toe))), (-18, top), (0, top + 0.36), (wall_at, top), (wall_at + 0.01, foot)]
+    return SectionSpec(station, g, d)
+
+
+def curbed_street(station: str, ground_elev: float, depth: float, curb: float) -> SectionSpec:
+    """A street in cut between vertical curbs, sidewalks behind them sloping
+    up to the ground."""
+    g = [(-140, ground_elev), (-60, ground_elev + 0.5), (60, ground_elev + 0.8), (140, ground_elev + 0.6)]
+    base = ground_elev - depth
+    d = [(-30, float(_interp(g, -30))), (-24, base + curb + 0.12), (-18, base + curb), (-17.99, base),
+         (0, base + 0.3), (17.99, base), (18, base + curb), (24, base + curb + 0.12), (30, float(_interp(g, 30)))]
+    return SectionSpec(station, g, d)
+
+
 def rolling_section(station: str, elev: float, amp: float = 2.0, phase: float = 0.0) -> SectionSpec:
     """Rolling ground that crosses a flat template several times, so one
     section has several separate cut zones and fill zones."""
@@ -147,6 +170,11 @@ def _draw_section(page: fitz.Page, spec: SectionSpec, y_axis: float, x_c: float,
         shape.draw_polyline(top + bot + top[:1])
     for x in spec.poles:                                           # a pole: upright line with a cross arm
         g = float(_interp(spec.ground, x))
+        if spec.pole_style == "box":
+            shape.draw_rect(fitz.Rect(sx(x - 0.5), sy(g + 25), sx(x + 0.5), sy(g - 6)))
+            shape.draw_line((sx(x - 3), sy(g + 23)), (sx(x + 3), sy(g + 23)))
+            shape.draw_line((sx(x), sy(g + 22)), (sx(x + 12), sy(float(_interp(spec.ground, x + 12)))))
+            continue
         shape.draw_line((sx(x), sy(g)), (sx(x), sy(g + 14)))
         shape.draw_line((sx(x - 2), sy(g + 12.5)), (sx(x + 2), sy(g + 12.5)))
     if spec.pavement or spec.poles:

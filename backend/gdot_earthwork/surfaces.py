@@ -33,6 +33,7 @@ from .tracing import (
     denoise,
     densify,
     despike,
+    drop_poles,
     drop_rulers,
     drop_structures,
     fill_along_gridlines,
@@ -43,6 +44,7 @@ from .tracing import (
     snap_top,
     split_chain,
     split_dash_solid,
+    square_steps,
     strip_grid,
     template_strokes,
     trace_ground,
@@ -69,6 +71,8 @@ MIN_TEMPLATE_PX = int(15 * CANON_PPF)
 # A traced point this close (canonical px) to a grid row may be a line that
 # ran on along it and was erased with the grid.
 GRID_TOL_PX = 9.0
+# ... and how far along it such an erased stretch may run.
+GRID_GAP_FT = 30.0
 
 
 @dataclass
@@ -144,10 +148,17 @@ SUBGRADE_REACH_FT = 3.5
 
 
 def _finish(ground_px: dict, design_px: dict, solid: np.ndarray, roi: np.ndarray,
-            W: int, H: int, cfg: PipelineConfig, source: str, refine: bool) -> Surfaces:
+            W: int, H: int, cfg: PipelineConfig, source: str, refine: bool, exact=None) -> Surfaces:
+    """`exact` (vector sheets): the rows of the drawn strokes at each column,
+    (ground, design) as from _rows_at -- the traced lines are moved onto them
+    (_on_strokes), so they lie where the drawing puts them rather than on
+    the whole pixels they were rasterised to."""
     if refine:
         ground_px, _ = refine_gaps(ground_px, roi, CANON_PPF, cfg.gap_refine_ft, cfg.gap_tol_px)
         design_px, _ = refine_gaps(design_px, solid, CANON_PPF, cfg.gap_refine_ft, cfg.gap_tol_px)
+    on = _on_strokes if exact else (lambda chain, rows: chain)
+    ground_px = on(ground_px, exact and exact[0])
+    design_px = on(design_px, exact and exact[1])
     _, gap_g = interp_spans(ground_px, W, CANON_PPF, cfg.gap_warn_ft)
     G, _ = despike(densify(ground_px, W), cfg.despike_win, cfg.despike_px)
 
@@ -158,7 +169,7 @@ def _finish(ground_px: dict, design_px: dict, solid: np.ndarray, roi: np.ndarray
     gap_d = 0.0
     reach = int(SUBGRADE_REACH_FT * CANON_PPF)
     for pc in pieces:
-        for arr, chain in ((D, pc), (B, snap_bottom(solid, pc, reach))):
+        for arr, chain in ((D, pc), (B, on(snap_bottom(solid, pc, reach), exact and exact[1]))):
             dense = densify(chain, W)
             ok = ~np.isnan(dense)
             arr[ok] = dense[ok]
@@ -259,10 +270,11 @@ def raster_surfaces(frame: Frame, img: PageImage, cfg: PipelineConfig, exclude=N
     roi, _ = denoise(roi)
     dash, solid, _, _ = split_dash_solid(roi)
     solid = drop_rulers(solid, int(0.4 * W))
-    solid = template_strokes(solid, LINK_PX, MIN_TEMPLATE_PX)
+    solid = drop_poles(solid, CANON_PPF)
+    grid_rows = [((a + b) / 2 - y0) * sy for a, b in frame.hlines]
+    solid = template_strokes(solid, LINK_PX, MIN_TEMPLATE_PX, grid_rows, GRID_TOL_PX, int(GRID_GAP_FT * CANON_PPF))
     solid = _drop_detached_in_margins(solid, (frame.top - y0) * sy, (frame.bottom - y0) * sy)
     ground_px = trace_ground(dash, solid, HIDDEN_GROUND_WEIGHT, TRACE_WINDOW, CANON_PPF)
-    grid_rows = [((a + b) / 2 - y0) * sy for a, b in frame.hlines]
 
     def trace(mask):
         d = trace_design(mask, ground_px, grid_rows=grid_rows)
@@ -340,7 +352,7 @@ def trace_design(mask: np.ndarray, ground: dict | None = None, rounds: int = 3,
         if ground is not None and not _ties_into(last, ground, chain, grid_rows):
             continue
         chain = {**chain, **{x: y for x, y in last.items() if x not in chain}}
-    return dict(sorted(chain.items()))
+    return dict(sorted(square_steps(chain, mask).items()))
 
 
 def _ties_into(piece: dict, ground: dict, chain: dict | None = None, grid_rows: list[float] | None = None,
@@ -361,32 +373,36 @@ def _ties_into(piece: dict, ground: dict, chain: dict | None = None, grid_rows: 
     return True
 
 
-def _along_grid(piece: dict, end: int, chain: dict, grid_rows: list[float], tol: float = GRID_TOL_PX) -> bool:
-    """The piece's `end` and the chain's nearest point beyond it both lie on
-    the same grid row: the line ran on between them along the grid and was
-    erased with it (fill_along_gridlines bridges such a gap)."""
+def _along_grid(piece: dict, end: int, chain: dict, grid_rows: list[float], tol: float = GRID_TOL_PX,
+                gap_ft: float = GRID_GAP_FT, step_ft: float = 3.0) -> bool:
+    """The piece's `end` lies on a grid row and the chain resumes beyond it
+    within `gap_ft`, level with it or `step_ft` up or down (a curb face, a
+    wall): the line ran on along the grid from that end and was erased with
+    it (fill_along_gridlines bridges such a gap along the row, square_steps
+    puts back the step at a face)."""
     beyond = [x for x in chain if (x < end if end == min(piece) else x > end)]
     if not beyond:
         return False
     other = max(beyond) if end == min(piece) else min(beyond)
     rows = np.asarray(grid_rows, float)
     r = rows[np.argmin(np.abs(rows - piece[end]))]
-    return abs(piece[end] - r) <= tol and abs(chain[other] - r) <= tol
+    return (abs(piece[end] - r) <= tol and abs(other - end) <= gap_ft * CANON_PPF
+            and abs(chain[other] - piece[end]) <= step_ft * CANON_PPF)
 
 
-def _finish_with_retry(ground_px, trace, solid, roi, W, H, cfg, source, refine) -> Surfaces:
+def _finish_with_retry(ground_px, trace, solid, roi, W, H, cfg, source, refine, exact=None) -> Surfaces:
     """Trace the design and finish. When the strongest solid line turns out
     to be a buried pipe or utility (rejected whole, leaving no design over
     the ground), erase it and trace again: the template is usually the next
     line down the list. The rejected run is still reported."""
     design_px = trace(solid)
-    s = _finish(ground_px, design_px, solid, roi, W, H, cfg, source, refine)
+    s = _finish(ground_px, design_px, solid, roi, W, H, cfg, source, refine, exact)
     if s.overlap.any() or not s.trimmed or not design_px:
         return s
     rest = _erase_chain(solid, design_px)
     if not rest.any():
         return s
-    again = _finish(ground_px, trace(rest), rest, roi, W, H, cfg, source, refine)
+    again = _finish(ground_px, trace(rest), rest, roi, W, H, cfg, source, refine, exact)
     if not again.overlap.any():
         return s
     again.trimmed = s.trimmed + again.trimmed
@@ -469,12 +485,15 @@ def _is_dashed(d: dict) -> bool:
 def vector_strokes(frame: Frame, img: PageImage, cfg: PipelineConfig):
     """Dashed and solid data strokes inside the frame, in canonical frame-local
     pixels. Grid lines, tick marks and text glyphs are filtered out; filled
-    pavement bands count as solid strokes (their outline)."""
+    pavement bands count as solid strokes (their outline). Solid uprights
+    as tall as a grid line but off the grid (a utility pole) are left out
+    too, and returned apart so their guys can be found (drop_poles).
+    Returns (dashed, solid, uprights, W, H)."""
     k = img.scale
     sx, sy, W, H = _canon_size(frame, cfg)
     fw, fh = frame.right - frame.left, frame.bottom - frame.top
     edge = 0.08 * frame.pitch_y
-    dashed, solid, short, glyphs = [], [], [], []
+    dashed, solid, short, glyphs, uprights = [], [], [], [], []
     # text labels in page-image pixels: (x0, y0, x1, y1, is a word note)
     boxes = [(sp.x - hw, sp.y - hh, sp.x + hw, sp.y + hh, sum(c.isalpha() for c in sp.text) >= 3)
              for sp in img.spans if sp.text.strip() for hw, hh in [_half_box(sp)]]
@@ -519,6 +538,10 @@ def vector_strokes(frame: Frame, img: PageImage, cfg: PipelineConfig):
                                           or min(abs(ay - frame.top), abs(ay - frame.bottom)) < 3):
                 continue
             if vert and abs(ay - by) > 0.5 * fh and not is_dash:
+                if (not any(a - 2 <= ax <= b + 2 for a, b in frame.vlines)
+                        and min(abs(ax - frame.left), abs(ax - frame.right)) > 3):
+                    uprights.append(((ax - frame.left) * sx, (ay - frame.y0) * sy,
+                                     (bx - frame.left) * sx, (by - frame.y0) * sy))
                 continue
             # axis tick marks: short solid strokes hugging the frame edge
             # (often drawn as one path spanning the whole axis)
@@ -538,7 +561,7 @@ def vector_strokes(frame: Frame, img: PageImage, cfg: PipelineConfig):
         glyphs.append(((sp.x - half - frame.left) * sx, (sp.y - sp.size / 2 - frame.y0) * sy,
                        (sp.x + half - frame.left) * sx, (sp.y + sp.size / 2 - frame.y0) * sy))
     solid = [s_ for s_ in solid if not _is_underline(s_, glyphs)]
-    return dashed, solid, W, H
+    return dashed, solid, uprights, W, H
 
 
 def _half_box(sp) -> tuple[float, float]:
@@ -672,15 +695,56 @@ def _draw(segs, W, H) -> np.ndarray:
 def vector_surfaces(frame: Frame, img: PageImage, cfg: PipelineConfig, exclude=None, erase=None) -> Surfaces | None:
     if img.page is None:
         return None
-    dashed, solid, W, H = vector_strokes(frame, img, cfg)
+    dashed, solid, uprights, W, H = vector_strokes(frame, img, cfg)
     if len(dashed) < 3 or len(solid) < 2:
         return None          # this sheet doesn't draw ground dashed -- fall back to raster
     dmask, smask = _draw(dashed, W, H), _draw(solid, W, H)
+    up = _draw(uprights, W, H)
+    smask = drop_poles(smask | up, CANON_PPF) & (1 - up)
     smask = template_strokes(smask, LINK_PX, MIN_TEMPLATE_PX)
     sy = _canon_size(frame, cfg)[1]
     smask = _drop_detached_in_margins(smask, (frame.top - frame.y0) * sy, (frame.bottom - frame.y0) * sy)
     gc, gw = ground_candidates(dmask, smask, HIDDEN_GROUND_WEIGHT)
     ground_px = best_path(gc, win=TRACE_WINDOW, weights=gw)
+    exact = (_rows_at(dashed + solid, W), _rows_at(solid, W))
     return _finish_with_retry(ground_px, lambda m: trace_design(m, ground_px),
                               _blank_columns(smask, frame, _canon_size(frame, cfg)[0], exclude, erase,
-                                             _canon_size(frame, cfg)[1]), dmask | smask, W, H, cfg, "vector", refine=False)
+                                             _canon_size(frame, cfg)[1]), dmask | smask, W, H, cfg, "vector", refine=False,
+                              exact=exact)
+
+
+def _rows_at(segs, W: int) -> dict[int, np.ndarray]:
+    """Column -> the exact rows (canonical px) of the drawn segments crossing
+    it. Columns are sampled at their centres, as _draw puts them."""
+    cols, rows = [], []
+    for x0, y0, x1, y1 in segs:
+        if x1 < x0:
+            x0, y0, x1, y1 = x1, y1, x0, y0
+        if x1 - x0 < 1e-6:
+            continue
+        c = np.arange(max(0, int(np.ceil(x0))), min(W - 1, int(np.floor(x1))) + 1)
+        if len(c):
+            cols.append(c)
+            rows.append(y0 + (c - x0) * (y1 - y0) / (x1 - x0))
+    if not cols:
+        return {}
+    c, r = np.concatenate(cols), np.concatenate(rows)
+    order = np.argsort(c, kind="stable")
+    c, r = c[order], r[order]
+    keys, starts = np.unique(c, return_index=True)
+    return {int(k): v for k, v in zip(keys, np.split(r, starts[1:]))}
+
+
+def _on_strokes(chain: dict[int, float], rows: dict[int, np.ndarray], tol: float = 1.5) -> dict[int, float]:
+    """Each traced point moved onto the drawn stroke it lies on: the nearest
+    exact row within `tol` px (a stroke is drawn 2-3 px thick, centred on its
+    rounded position), the point as traced where none is that close."""
+    out = {}
+    for x, y in chain.items():
+        r = rows.get(x)
+        if r is not None:
+            i = int(np.argmin(np.abs(r - y)))
+            if abs(r[i] - y) <= tol:
+                y = float(r[i])
+        out[x] = y
+    return out

@@ -8,7 +8,7 @@ import pytest
 from gdot_earthwork.plan_set import process_plan_set
 from gdot_earthwork.tracing import strip_grid
 
-from .synth import cut_section, make_pdf, true_areas
+from .synth import curbed_street, cut_section, make_pdf, true_areas
 
 
 @pytest.mark.parametrize("scanned", [False, True], ids=["vector", "scan"])
@@ -23,6 +23,22 @@ def test_roadbed_on_a_grid_line_is_measured_whole(tmp_path, scanned):
     for s, spec in zip(res.sections, specs[::-1]):
         cut = true_areas(spec)[1]
         assert abs(s.cut_ft2 - cut) <= 0.02 * cut, (s.station_label, s.cut_ft2, cut)
+
+
+def test_sidewalks_on_a_grid_line_stay_with_the_street(tmp_path):
+    # the bottom street's curb tops and sidewalks lie on the 660 grid line:
+    # erased with it, the side slopes behind them are left as short strokes
+    # 6 ft from the rest of the template
+    specs = [curbed_street("15+50", 662.3, 3.0, 0.5), curbed_street("15+00", 662.3, 1.5, 0.67),
+             curbed_street("14+50", 662.3, 3.0, 0.67)]
+    pdf = tmp_path / "curbs.pdf"
+    make_pdf(str(pdf), [specs], scanned=True)
+    res = process_plan_set(str(pdf), workers=1, overlays=False)
+    assert len(res.sections) == 3
+    for s in res.sections:
+        spec = specs[s.index]
+        cut = true_areas(spec)[1]
+        assert abs(s.cut_ft2 - cut) <= 0.02 * cut, (spec.station, s.cut_ft2, cut)
 
 
 def test_ground_near_the_template_is_not_welded_to_it_across_a_grid_line():

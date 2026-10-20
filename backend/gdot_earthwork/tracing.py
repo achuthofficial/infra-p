@@ -301,6 +301,47 @@ def best_path(cands, reward=3.0, win=260, slope=0.6, slack=8.0, gap_pen=0.04,
     return {int(xs[i]): float(ys[i]) for i in reversed(path)}
 
 
+def square_steps(chain: dict[int, float], mask: np.ndarray, min_step: float = 4.0, cover: float = 0.7,
+                 near: float = 3.0) -> dict[int, float]:
+    """Vertical faces as drawn: square corners, not slopes. A chain moves at
+    most `slope` px per column (best_path), so where the line drops down a
+    wall face, a curb or any vertical step, it skips the columns after the
+    face and densify() bridges them with a slope -- cutting a triangle off
+    the corner at the face's foot (a 3 ft wall face loses ~4 ft of floor).
+    Where consecutive points more than a column apart differ by `min_step`
+    px or more and a column between them is inked over `cover` of the rise
+    (the face), the columns before the face follow the ink at the first
+    point's level, those after it the ink at the second's (within `near`
+    px, the level carried flat where there is none)."""
+    if len(chain) < 2:
+        return chain
+    xs = sorted(chain)
+    out = dict(chain)
+    H = mask.shape[0]
+    for a, b in zip(xs, xs[1:]):
+        ya, yb = chain[a], chain[b]
+        if b - a < 2 or abs(yb - ya) < min_step:
+            continue
+        lo, hi = int(np.ceil(min(ya, yb) + 2)), int(np.floor(max(ya, yb) - 2))
+        if hi <= lo:
+            continue
+        faces = [x for x in range(a, b + 1) if mask[max(0, lo):min(H, hi + 1), x].mean() >= cover]
+        if not faces:
+            continue
+        f = faces[len(faces) // 2]
+        for x in range(a + 1, b):
+            out[x] = _stroke_near(mask, x, ya if x < f else yb, near)
+    return out
+
+
+def _stroke_near(mask: np.ndarray, x: int, y: float, near: float) -> float:
+    """Centre of the stroke in column x nearest row y, within `near` px; y if none."""
+    r0 = max(0, int(y - near - 2))
+    runs = runs1d(np.flatnonzero(mask[r0:int(y + near + 3), x]) + r0, tol=1)
+    mids = [(s_ + e) / 2.0 for s_, e in runs if abs((s_ + e) / 2.0 - y) <= near]
+    return float(min(mids, key=lambda m: abs(m - y))) if mids else float(y)
+
+
 def snap_top(mask: np.ndarray, chain: dict[int, float], rad: int = 9) -> dict[int, float]:
     """The template is drawn as a thin box (surface + pavement structure), so the
     finished surface is the TOPMOST stroke -- and we want that stroke's CENTRE.
@@ -615,7 +656,8 @@ def fill_along_gridlines(chain: dict[int, float], grid_rows: list[float], min_ga
     return out
 
 
-def template_strokes(solid: np.ndarray, link_px: int, min_px: int) -> np.ndarray:
+def template_strokes(solid: np.ndarray, link_px: int, min_px: int, grid_rows: list[float] | None = None,
+                     grid_tol: float = 9.0, grid_gap: int = 0) -> np.ndarray:
     """Keep the solid strokes that make up the roadway template.
 
     The template (pavement, shoulders, side slopes, ditches) is one network
@@ -624,11 +666,25 @@ def template_strokes(solid: np.ndarray, link_px: int, min_px: int) -> np.ndarray
     it, and they are short. Group strokes lying within `link_px` of each
     other and keep only the wide groups: the widest one, plus any other spanning at
     least 30 % of it (a second roadway beyond a median, the far side of a
-    structure) and at least `min_px`."""
+    structure) and at least `min_px`.
+
+    On a scan, a stretch of template lying on a grid line (a sidewalk or
+    shoulder at a round elevation) is erased with the grid, leaving the
+    strokes either side further apart than `link_px`: strokes meeting the
+    same grid row (`grid_rows`, within `grid_tol` px) up to `grid_gap` px
+    apart are grouped as well."""
     if not solid.any():
         return solid
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (link_px, link_px))
-    n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.dilate(solid, k), 8)
+    linked = cv2.dilate(solid, k)
+    H = solid.shape[0]
+    for r in grid_rows or []:
+        band = solid[max(0, int(r - grid_tol)):min(H, int(r + grid_tol) + 1)]
+        runs = runs1d(np.flatnonzero(band.any(axis=0)), tol=1)
+        for (_, e), (s_, _) in zip(runs, runs[1:]):
+            if link_px < s_ - e <= grid_gap:
+                linked[int(r), e:s_ + 1] = 1
+    n, lab, st, _ = cv2.connectedComponentsWithStats(linked, 8)
     if n <= 2:
         return solid
     widths = st[1:, cv2.CC_STAT_WIDTH] - link_px
@@ -800,6 +856,117 @@ def trace_ground(dash: np.ndarray, template: np.ndarray, hidden_weight: float, w
     weights = [[1.0] * len(a) + ([] if release[x] else [hidden_weight] * len(b))
                for x, (a, b) in enumerate(zip(cd, ct))]
     return best_path(cands, win=win, weights=weights)
+
+
+def drop_poles(solid: np.ndarray, ppf: float, min_ft: float = 8.0, max_w_ft: float = 1.5,
+               clear_ft: float = 5.0, reach_ft: float = 20.0, wide_ft: float = 10.0) -> np.ndarray:
+    """Remove utility poles (and other free-standing uprights) from the
+    template mask. A pole is drawn in the template's solid pen -- a single
+    line or a narrow box, often carried on below the ground, with a cross
+    arm and maybe a down guy -- and where it stands in the graded section
+    the tracers follow it: the design runs down the pole to its foot, the
+    subgrade snaps to the box's floor or to a guy passing under a side slope,
+    and the zone comes out notched at the pole.
+
+    A pole is one or two vertical strokes at least `min_ft` tall within
+    `max_w_ft` of each other, whose top stands clear: once its guys are set
+    aside, no wide stroke (`wide_ft`, the template) comes within `clear_ft`
+    of its top within `reach_ft` either side. A wall face is as tall, but
+    its top meets the roadway (fill wall) or the back slope climbing on to
+    the ground (cut wall), so it stays. The pole goes with its guys, every
+    piece lying within its width (a box pole's top and floor) and every
+    piece hanging off it that is no wider than a pole (a ground dash welded
+    to its foot) or lies up by its top (the cross arm). Where the template
+    crossed a pole or a guy, the gap left is a few pixels wide, bridged like
+    any other."""
+    if not solid.any():
+        return solid
+    vert = cv2.morphologyEx(solid, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(min_ft * ppf))))
+    if not vert.any():
+        return solid
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.dilate(vert, np.ones((1, 3), np.uint8)), 8)
+    max_w = int(max_w_ft * ppf) + 3
+    bars = sorted((k for k in range(1, n) if st[k, cv2.CC_STAT_WIDTH] <= max_w), key=lambda k: st[k, cv2.CC_STAT_LEFT])
+    if not bars:
+        return solid
+    # the uprights side by side within a pole's width are one pole (a box)
+    groups: list[list[int]] = []
+    for k in bars:
+        if groups and st[k, cv2.CC_STAT_LEFT] + st[k, cv2.CC_STAT_WIDTH] - st[groups[-1][0], cv2.CC_STAT_LEFT] <= max_w:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+    H, W = solid.shape
+    reach, clear = int(reach_ft * ppf), int(clear_ft * ppf)
+    upright = np.isin(lab, bars)
+    rest = (solid & ~upright).astype(np.uint8)
+    poles = []
+    for g in groups:
+        x0 = min(st[k, cv2.CC_STAT_LEFT] for k in g)
+        x1 = max(st[k, cv2.CC_STAT_LEFT] + st[k, cv2.CC_STAT_WIDTH] for k in g)
+        top = min(st[k, cv2.CC_STAT_TOP] for k in g)
+        bot = max(st[k, cv2.CC_STAT_TOP] + st[k, cv2.CC_STAT_HEIGHT] for k in g)
+        poles.append((g, x0, x1, top, bot, _guys(rest, x0, x1, top, bot, reach, ppf)))
+    guys = np.zeros_like(rest)
+    for *_, gm in poles:
+        guys |= gm
+    m, lab2, st2, _ = cv2.connectedComponentsWithStats(rest & ~guys, 8)
+    wide = np.zeros(m, bool)
+    wide[1:] = st2[1:, cv2.CC_STAT_WIDTH] >= wide_ft * ppf
+    wide_mask = wide[lab2]
+    out = solid.copy()
+    for g, x0, x1, top, _, gm in poles:
+        if wide_mask[:min(H, top + clear + 1), max(0, x0 - reach):min(W, x1 + reach)].any():
+            continue
+        here = np.isin(lab, g)
+        out[here] = 0
+        out[gm > 0] = 0
+        touching = np.zeros(m, bool)
+        touching[np.unique(lab2[cv2.dilate((here | (gm > 0)).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0])] = True
+        inside = (st2[:, cv2.CC_STAT_LEFT] >= x0 - 1) & (st2[:, cv2.CC_STAT_LEFT] + st2[:, cv2.CC_STAT_WIDTH] <= x1 + 1)
+        by_top = st2[:, cv2.CC_STAT_TOP] + st2[:, cv2.CC_STAT_HEIGHT] <= top + clear
+        gone = inside | (touching & ((st2[:, cv2.CC_STAT_WIDTH] <= max_w) | by_top))
+        gone[0] = False
+        if gone.any():
+            out[gone[lab2]] = 0
+    return out
+
+
+def _guys(rest: np.ndarray, x0: int, x1: int, top: int, bot: int, reach: int, ppf: float,
+          min_ft: float = 6.0, steep: float = 1.0) -> np.ndarray:
+    """Down guys of the pole standing in columns x0..x1 from row `top` to
+    `bot`: straight strokes at least `min_ft` long, steeper than `steep`
+    (rise over run; side slopes are flatter), whose upper end meets the
+    upper part of the pole, followed on down their line to the pole's foot.
+    Returns their pixels in `rest`."""
+    out = np.zeros_like(rest)
+    c0, c1 = max(0, x0 - reach), min(rest.shape[1], x1 + reach)
+    r0, r1 = max(0, top - 4), min(rest.shape[0], bot + 4)
+    win = rest[r0:r1, c0:c1]
+    if not win.any():
+        return out
+    segs = cv2.HoughLinesP(win * 255, 1, np.pi / 180, int(3 * ppf), minLineLength=int(min_ft * ppf), maxLineGap=4)
+    if segs is None:
+        return out
+    upper = top + 0.4 * (bot - top)
+    band = np.zeros_like(win)
+    for xa, ya, xb, yb in segs.reshape(-1, 4):
+        if abs(yb - ya) < steep * abs(xb - xa) or xa == xb:
+            continue                                         # not steep, or an upright (no guy)
+        (hx, hy), (lx, ly) = ((xa, ya), (xb, yb)) if ya < yb else ((xb, yb), (xa, ya))
+        # the guy's line, carried up, meets the pole's upper part -- maybe above
+        # the frame, which can cut a pole's top off (where the guy runs into
+        # the pole its detected end is a few px off)
+        xc = (x0 + x1) / 2 - c0
+        yc = hy + (xc - hx) * (ly - hy) / (lx - hx)
+        if abs(hx - xc) <= 2 * ppf and hy + r0 <= upper and yc + r0 <= upper:
+            # and on down to the anchor: where the guy crosses the template
+            # the piece below is a separate, shorter stroke
+            foot = win.shape[0] - 1
+            ex = lx + (lx - hx) * (foot - ly) / (ly - hy)
+            cv2.line(band, (int(round(xc)), int(round(yc))), (int(round(ex)), foot), 1, 5)
+    out[r0:r1, c0:c1] = band & win
+    return out
 
 
 def drop_rulers(solid: np.ndarray, min_len: int, max_rise: int = 4) -> np.ndarray:
