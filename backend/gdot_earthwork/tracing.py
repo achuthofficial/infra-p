@@ -158,11 +158,14 @@ def _bridged(a: np.ndarray, b: np.ndarray, bridge: int) -> np.ndarray:
     return out
 
 
-def denoise(roi: np.ndarray) -> tuple[np.ndarray, int]:
+def denoise(roi: np.ndarray, up: float = 1.0) -> tuple[np.ndarray, int]:
     """Drop annotation glyphs, traffic arrows and survey specks. Discriminator is
     BOX FILL RATIO: a digit fills ~0.3-0.6 of its bounding box, a 2 px line
     through the same box fills < 0.15. Builds one keep/drop table indexed by
-    component label and applies it in a single vectorized pass."""
+    component label and applies it in a single vectorized pass. `up`:
+    canonical px per scanned px -- lettering and pen strokes have a size on
+    paper, so on a sheet drawn at a small scale (1 in = 40 ft), enlarged to
+    the canonical resolution, they come out that much bigger."""
     n, lab, st, _ = cv2.connectedComponentsWithStats(roi, 8)
     drop = np.zeros(n, dtype=bool)
     dropped = 0
@@ -171,16 +174,16 @@ def denoise(roi: np.ndarray) -> tuple[np.ndarray, int]:
         f = a / (w * h)
         # glyph-sized and dense | a solid symbol (filled arrow, north arrow) --
         # compact, never a long flat box like a pavement section | a speck
-        if (8 <= w <= 70 and 10 <= h <= 55 and f >= 0.30) \
-           or (a > 700 and f >= 0.35 and max(w, h) <= 4 * min(w, h)) \
-           or (a <= 12 and w <= 7 and h <= 7):
+        if (8 * up <= w <= 70 * up and 10 * up <= h <= 55 * up and f >= 0.30) \
+           or (a > 700 * up * up and f >= 0.35 and max(w, h) <= 4 * min(w, h)) \
+           or (a <= 12 * up * up and w <= 7 * up and h <= 7 * up):
             drop[k] = True
             dropped += 1
     keep = np.where(drop[lab], 0, roi).astype(roi.dtype)
     return keep, dropped
 
 
-def split_dash_solid(mask: np.ndarray):
+def split_dash_solid(mask: np.ndarray, up: float = 1.0):
     """Existing ground is DASHED, the proposed template is SOLID. Estimate the
     dash length from the component-width distribution and cut at 3x the median,
     so the threshold adapts to scan resolution instead of being hard-coded.
@@ -204,9 +207,9 @@ def split_dash_solid(mask: np.ndarray):
             w, h, area = st[k, cv2.CC_STAT_WIDTH], st[k, cv2.CC_STAT_HEIGHT], st[k, cv2.CC_STAT_AREA]
             length = float(np.hypot(w, h))
             thickness = area / max(length, 1.0)
-            is_dash[k] = (length >= 6 and thickness <= 7.0 and length / max(thickness, 1.0) >= 1.8
+            is_dash[k] = (length >= 6 * up and thickness <= 7.0 * up and length / max(thickness, 1.0) >= 1.8
                           and h <= 1.6 * w + 3)
-    is_dash &= _collinear_support(lab, st, is_dash)
+    is_dash &= _collinear_support(lab, st, is_dash, reach=24.0 * up)
     solid = np.where(is_solid[lab], mask, 0).astype(mask.dtype)
     dash = np.where(is_dash[lab], mask, 0).astype(mask.dtype)
     return dash, solid, thr, dash_w

@@ -33,8 +33,11 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from .digits import read_station
 from .pages import PageImage, parse_station
+from .tracing import strip_grid
 
+SURE_MARGIN = 0.15      # digits.read_station margin at which its reading stands alone
 OCR_STATION_RE = re.compile(r"(?<![\d.])(\d{1,4})[ ]?\+[ ]?(\d{2})(?:[ ]?\.[ ]?(\d{1,2}))?(?![\d])")
 
 
@@ -404,19 +407,70 @@ def _glyph_only(clean: np.ndarray, box, pitch: float, pad: int) -> np.ndarray:
     return np.where(drop[lab] | (ink == 0), 255, 0).astype(np.uint8)
 
 
-def _ocr_word(clean: np.ndarray, box, pitch: float) -> list[str]:
+def _with_grid_strokes(word: np.ndarray, on_grid: np.ndarray, box, pad: int,
+                       on_hgrid: np.ndarray | None = None) -> np.ndarray:
+    """The word with the grid pixels inside its lettering put back: of the
+    vertical grid lines, within its text rows; of the horizontal ones (with
+    `on_hgrid`), within the columns of its glyphs only, never across the gaps
+    between them. Pieces left standing alone (a grid line passing between two
+    glyphs, which would read as a "1") are dropped again: what remains is
+    glyph strokes that lie on a grid line -- the side of a "0" on a vertical
+    one, the top of a "0" or a "7" on a horizontal one."""
+    x, y, w, h = box
+    y0, x0 = max(0, y - pad), max(0, x - pad)
+    ink = (word < 128).astype(np.uint8)
+    sub = on_grid[y0:y0 + word.shape[0], x0:x0 + word.shape[1]].copy()
+    sub[:max(0, y - y0)] = 0
+    sub[max(0, y - y0) + h:] = 0
+    if on_hgrid is not None:
+        hs = on_hgrid[y0:y0 + word.shape[0], x0:x0 + word.shape[1]].copy()
+        n, lab, st, _ = cv2.connectedComponentsWithStats(ink, 8)
+        cols = np.zeros(word.shape[1], bool)
+        for k in range(1, n):
+            if st[k, cv2.CC_STAT_HEIGHT] >= 0.5 * h:          # a glyph, not a dash of the ground line
+                cols[st[k, cv2.CC_STAT_LEFT]:st[k, cv2.CC_STAT_LEFT] + st[k, cv2.CC_STAT_WIDTH]] = True
+        hs[:, ~cols] = 0
+        sub |= hs
+    both = ink | sub
+    n, lab, _, _ = cv2.connectedComponentsWithStats(both, 8)
+    alone = np.ones(n, bool)
+    alone[np.unique(lab[ink > 0])] = False
+    alone[0] = False
+    both[alone[lab]] = 0
+    return np.where(both > 0, 0, 255).astype(np.uint8)
+
+
+def _ocr_word(clean: np.ndarray, box, pitch: float, on_grid: np.ndarray | None = None,
+              on_hgrid: np.ndarray | None = None) -> list[str]:
     """Readings of one word, by majority over a few renderings.
 
     CAD lettering is usually italic: shearing it upright is what makes
     tesseract usable on it -- but the same shear spoils an upright font. So
     the word is read sheared and plain, at two glyph heights, plus a
-    thickened read, stopping as soon as two readings agree. Returns every
+    thickened read, stopping as soon as two readings agree -- after a read
+    glyph by glyph (digits.read_station), which tesseract is only asked to
+    second when it is unsure of a digit. Returns every
     parseable reading (duplicates kept, so agreement is visible to the
     caller)."""
     x, y, w, h = box
     pad = int(0.1 * pitch)
     word = _glyph_only(clean, box, pitch, pad)
     border = lambda im: cv2.copyMakeBorder(im, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+    # read glyph by glyph first (digits.py): sure of every digit, it settles
+    # the label as two agreeing reads; otherwise it is one vote among them
+    out: list[str] = []
+    tries = [read_station(word)]
+    if on_grid is not None and on_grid.any():
+        tries.append(read_station(_with_grid_strokes(word, on_grid, box, pad)))
+    if not any(tries) and on_grid is not None and on_hgrid is not None and on_hgrid.any():
+        # only failing both: put back on a horizontal line, a stroke lying
+        # along it can as well turn a 5 into a 6 as close the top of a 0
+        tries.append(read_station(_with_grid_strokes(word, on_grid, box, pad, on_hgrid)))
+    glyphs = max((t for t in tries if t), key=lambda t: t[1], default=None)
+    if glyphs:
+        out = [glyphs[0]] * (2 if glyphs[1] >= SURE_MARGIN else 1)
+        if len(out) >= 2:
+            return out
 
     def render(height: int, shear: bool, thick: bool = False) -> np.ndarray:
         f = height / max(1, h)
@@ -431,7 +485,6 @@ def _ocr_word(clean: np.ndarray, box, pitch: float) -> list[str]:
 
     # tesseract's reading of these fonts depends on glyph size as much as on
     # slant ("1+" becomes "4+" at one size and not another), so vote across both
-    out: list[str] = []
     for height, shear, thick in ((40, True, False), (40, False, False), (64, True, False),
                                  (64, False, False), (64, True, True)):
         lab = _parse_ocr(_tesseract(render(height, shear, thick), "7"))
@@ -462,13 +515,24 @@ def _ocr_region(frame: Frame, img: PageImage, ink_thresh: int, x0: int, y0: int,
     if crop.size == 0:
         return None
     # erase the grid at its known position first: CAD masks the grid around
-    # text, so the stubs left next to a label are too short to be found as lines
-    for a, b in frame.vlines:
-        if b >= x0:
-            crop[:, max(0, a - x0):max(0, b - x0 + 1)] = 255
-    for a, b in frame.hlines:
-        crop[max(0, a - y0):max(0, b - y0 + 1), :] = 255
-    clean = _clean_for_ocr(crop, ink_thresh)
+    # text, so the stubs left next to a label are too short to be found as
+    # lines. Where a label is lettered over the grid instead, the glyph strokes
+    # crossing a grid line are bridged back across it (strip_grid): blanked,
+    # a "0" splits in two and the "1" beside the gap reads as "9" or "4".
+    h, w = crop.shape
+    V = [(a - x0, b - x0) for a, b in frame.vlines if b >= x0 and a - x0 < w]
+    Hh = [(a - y0, b - y0) for a, b in frame.hlines if b >= y0 and a - y0 < h]
+    raw = (crop < ink_thresh).astype(np.uint8)
+    ink = strip_grid(raw, V, Hh, bridge=3)
+    clean = _clean_for_ocr(np.where(ink > 0, 0, 255).astype(np.uint8), 128)
+    # what lay on the vertical grid lines: a glyph stroke running along one
+    # (the side of a "0") is erased with it, and nothing crosses it to bridge
+    on_grid = np.zeros_like(raw)
+    for a, b in V:
+        on_grid[:, max(0, a):b + 1] = raw[:, max(0, a):b + 1]
+    on_hgrid = np.zeros_like(raw)
+    for a, b in Hh:
+        on_hgrid[max(0, a):b + 1, :] = raw[max(0, a):b + 1, :]
     ink = (clean < 128).astype(np.uint8)
     best = None
     # A station ("12+50", "97+50.00") is at least four glyphs wide; elevation
@@ -477,7 +541,7 @@ def _ocr_region(frame: Frame, img: PageImage, ink_thresh: int, x0: int, y0: int,
     words = sorted((b for b in _word_boxes(ink, frame.pitch_y) if b[2] >= 1.8 * b[3]),
                    key=lambda b: -b[2] / b[3])
     for box in words[:4]:
-        reads = _ocr_word(clean, box, frame.pitch_y)
+        reads = _ocr_word(clean, box, frame.pitch_y, on_grid, on_hgrid)
         if not reads:
             continue
         # The majority reading wins; failing a majority, the most complete one

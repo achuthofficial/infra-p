@@ -269,9 +269,10 @@ def raster_surfaces(frame: Frame, img: PageImage, cfg: PipelineConfig, exclude=N
     # blank the outermost band: frame border, axis ticks
     m = 3
     roi[:m], roi[-m:], roi[:, :m], roi[:, -m:] = 0, 0, 0, 0
-    roi, _ = denoise(roi)
+    up = max(1.0, float(np.sqrt(sx * sy)))       # canonical px per scanned px
+    roi, _ = denoise(roi, up)
     roi = _drop_axis_ticks(roi, (frame.top - y0) * sy, (frame.bottom - y0) * sy)
-    dash, solid, _, _ = split_dash_solid(roi)
+    dash, solid, _, _ = split_dash_solid(roi, up)
     solid = drop_rulers(solid, int(0.4 * W))
     solid = drop_poles(solid, CANON_PPF)
     grid_rows = [((a + b) / 2 - y0) * sy for a, b in frame.hlines]
