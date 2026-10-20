@@ -45,7 +45,7 @@ def test_vector_sections_found_in_station_order(vector_result):
 
 
 def test_vector_areas_match_exact_geometry(vector_result):
-    _check_areas(vector_result, tol_rel=0.02, tol_abs=3.0)
+    _check_areas(vector_result, tol_rel=0.002, tol_abs=0.3)   # read off the drawn geometry
 
 
 def test_scanned_sheets_read_and_measured(scanned_result):

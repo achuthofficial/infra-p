@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 import pymupdf as fitz
 
@@ -99,11 +100,14 @@ def page_point(placement: dict, x: float, y: float) -> tuple[float, float]:
             displayed points; the page's derotation matrix undoes /Rotate.
     raster: the scan's own placement matrix maps its unit square onto the
             page; `flipped` undoes the quarter turn applied when the image
-            was stored sideways."""
+            was stored sideways, `skew` the straightening of a tilted scan."""
     if placement["kind"] == "vector":
         z = placement["zoom"]
         p = fitz.Point(x / z, y / z) * fitz.Matrix(*placement["derot"])
         return p.x, p.y
+    if placement.get("skew"):
+        (a, b, c), (d, e, f) = placement["skew"]       # straightened -> scanned pixel
+        x, y = a * x + b * y + c, d * x + e * y + f
     w0, h0 = placement["w0"], placement["h0"]
     if placement["flipped"]:              # pixel (x, y) of np.rot90(img, 3) is img[h0 - 1 - x, y]
         x, y = y, h0 - 1 - x
@@ -152,6 +156,73 @@ def _base_image(doc: fitz.Document, page: fitz.Page) -> tuple[np.ndarray, dict] 
     return arr, {"kind": "raster", "m": tuple(matrix), "w0": w0, "h0": h0, "flipped": flipped}
 
 
+def skew_angle(gray: np.ndarray, max_deg: float = 3.0) -> float:
+    """How far a scan is turned (degrees, counter-clockwise positive as
+    cv2.getRotationMatrix2D takes it). A sheet fed into a scanner at an angle
+    comes out tilted by a fraction of a degree, enough to break every grid
+    line into steps: 0.3 deg drops 16 px across a 3000 px sheet. The tilt is
+    the angle at which the ink's row profile is sharpest -- the grid lines,
+    borders and title rules each fall into the fewest rows: found coarsely
+    over +-`max_deg`, then to a few thousandths of a degree. 0 when no tilt
+    sharpens the profile clearly (a sheet without long lines)."""
+    coarse, _ = _profile_angle(_ink_points(gray, 1200), np.arange(-max_deg, max_deg + 1e-9, 0.1), with_level=True)
+    fine, _ = _profile_angle(_ink_points(gray, 2400), np.arange((coarse or 0.0) - 0.12, (coarse or 0.0) + 0.12 + 1e-9, 0.004),
+                             with_level=True, gain=1.002)
+    return float(fine) if fine is not None else (coarse or 0.0)
+
+
+def _ink_points(gray: np.ndarray, size: int, cap: int = 300_000):
+    """(rows, columns from the centre, darkness) of the ink of `gray` shrunk
+    to `size` px. Weighted by darkness, not thresholded: a thin tilted line
+    shrunk is only partly dark in most of the pixels it crosses."""
+    k = max(1, int(np.ceil(max(gray.shape) / size)))
+    small = cv2.resize(gray, (gray.shape[1] // k, gray.shape[0] // k), interpolation=cv2.INTER_AREA)
+    ys, xs = np.nonzero(small < 235)
+    if len(xs) > cap:
+        keep = np.random.default_rng(0).choice(len(xs), cap, replace=False)
+        ys, xs = ys[keep], xs[keep]
+    return ys.astype(np.float64), xs - small.shape[1] / 2.0, 255.0 - small[ys, xs]
+
+
+def _profile_angle(pts, angles, with_level: bool = False, gain: float = 1.02):
+    """The angle (of `angles`) sharpening the row profile most, with ties
+    resolved to their middle; with `with_level`, None unless it beats the
+    level profile by `gain`. Each pixel's weight is split between the two
+    rows it falls between: binned whole, every pixel of the level image would
+    land square on a row and the level profile look sharper than it is."""
+    ys, xc, w = pts
+    if len(ys) < 100:
+        return None, 0.0
+
+    def score(a):
+        r = ys + xc * np.tan(np.radians(a))
+        r -= r.min()
+        i = np.floor(r).astype(np.int64)
+        t = r - i
+        prof = np.bincount(i, weights=w * (1 - t), minlength=i.max() + 2) + \
+            np.bincount(i + 1, weights=w * t, minlength=i.max() + 2)
+        return float((prof * prof).sum())
+
+    scores = np.array([score(a) for a in angles])
+    best = float(angles[scores >= scores.max() * (1 - 1e-9)].mean())
+    if with_level and scores.max() < gain * score(0.0):
+        return None, 0.0
+    return best, float(scores.max())
+
+
+def straighten(gray: np.ndarray, min_deg: float = 0.03) -> tuple[np.ndarray, list | None]:
+    """The scan turned level (skew_angle), and the affine map from its
+    pixels back to the scan's (for page_point); unchanged and None when it
+    is level already."""
+    a = skew_angle(gray)
+    if abs(a) < min_deg:
+        return gray, None
+    h, w = gray.shape
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), -a, 1.0)
+    out = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=255)
+    return out, cv2.invertAffineTransform(M).tolist()
+
+
 def _text_spans(page: fitz.Page, scale: float) -> list[TextSpan]:
     """Words of the text layer, in page-image pixels. Words, not spans: CAD
     exports often place "105", "+" and "00" as separate spans, and a station
@@ -189,8 +260,14 @@ def load_page(doc: fitz.Document, index: int, vector_dpi: int = 300) -> PageImag
     scan, placement = _base_image(doc, page) if len(words) < 20 else (None, None)
     if scan is not None:
         scale = scan.shape[1] / page.rect.width
-        return PageImage(index + 1, scan, "raster", scale,
-                         _text_spans(page, scale) if words else [], page, placement=placement)
+        spans = _text_spans(page, scale) if words else []
+        scan, back = straighten(scan)
+        if back is not None:
+            placement["skew"] = back
+            fwd = cv2.invertAffineTransform(np.array(back))
+            for sp in spans:
+                sp.x, sp.y = (float(v) for v in fwd @ np.array([sp.x, sp.y, 1.0]))
+        return PageImage(index + 1, scan, "raster", scale, spans, page, placement=placement)
     # cap the render size: a 36x24 in sheet at 300 dpi would be ~78 megapixels
     zoom = min(vector_dpi / 72.0, MAX_RENDER_PX / max(page.rect.width, page.rect.height))
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY, alpha=False)

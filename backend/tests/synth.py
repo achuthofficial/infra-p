@@ -4,13 +4,15 @@ Synthetic cross-section sheets with exactly known answers.
 Draws GDOT-style sections -- 10 ft grid, offset axis with ticks and
 labels, station label, dashed existing ground, solid proposed template --
 into a vector PDF, and optionally a "scanned" copy (the same page rasterized
-and embedded as a single image, with no text layer). Because the geometry
-is generated, the true fill/cut area of every section is known exactly.
+and embedded as a single image, with no text layer), clean or degraded the
+way a real scanner degrades a sheet (Scan). Because the geometry is
+generated, the true fill/cut area of every section is known exactly.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 import pymupdf as fitz
 
@@ -25,6 +27,8 @@ class SectionSpec:
     design: list[tuple[float, float]]
     pavement: list[tuple[float, float, float]] = field(default_factory=list)  # existing asphalt: (from, to, thick ft)
     poles: list[float] = field(default_factory=list)                          # utility poles standing on the ground
+    pole_style: str = "line"     # "line": an upright with a cross arm; "box": a 1 ft box carried 6 ft into the
+                                 # ground, with a cross arm and a down guy anchored 12 ft to the right
     stage_mark: tuple[str, float, float] | None = None   # ("2", from, to): a "STAGE 2 CONSTRUCTION" dimension
 
 
@@ -92,6 +96,27 @@ def walled_cut(station: str, ground_elev: float, depth: float, wall_at: float = 
     return SectionSpec(station, g, d)
 
 
+def fill_wall(station: str, ground_elev: float, height: float, wall_at: float = 24.0) -> SectionSpec:
+    """A road on fill held by a vertical wall on the right: the roadway runs
+    flat to the wall's top, the face drops straight to the ground."""
+    g = [(-140, ground_elev), (-40, ground_elev + 0.4), (40, ground_elev - 0.3), (140, ground_elev - 0.5)]
+    top = ground_elev + height
+    foot = float(_interp(g, wall_at))
+    toe = -18 - 2 * height
+    d = [(toe, float(_interp(g, toe))), (-18, top), (0, top + 0.36), (wall_at, top), (wall_at + 0.01, foot)]
+    return SectionSpec(station, g, d)
+
+
+def curbed_street(station: str, ground_elev: float, depth: float, curb: float) -> SectionSpec:
+    """A street in cut between vertical curbs, sidewalks behind them sloping
+    up to the ground."""
+    g = [(-140, ground_elev), (-60, ground_elev + 0.5), (60, ground_elev + 0.8), (140, ground_elev + 0.6)]
+    base = ground_elev - depth
+    d = [(-30, float(_interp(g, -30))), (-24, base + curb + 0.12), (-18, base + curb), (-17.99, base),
+         (0, base + 0.3), (17.99, base), (18, base + curb), (24, base + curb + 0.12), (30, float(_interp(g, 30)))]
+    return SectionSpec(station, g, d)
+
+
 def rolling_section(station: str, elev: float, amp: float = 2.0, phase: float = 0.0) -> SectionSpec:
     """Rolling ground that crosses a flat template several times, so one
     section has several separate cut zones and fill zones."""
@@ -147,6 +172,11 @@ def _draw_section(page: fitz.Page, spec: SectionSpec, y_axis: float, x_c: float,
         shape.draw_polyline(top + bot + top[:1])
     for x in spec.poles:                                           # a pole: upright line with a cross arm
         g = float(_interp(spec.ground, x))
+        if spec.pole_style == "box":
+            shape.draw_rect(fitz.Rect(sx(x - 0.5), sy(g + 25), sx(x + 0.5), sy(g - 6)))
+            shape.draw_line((sx(x - 3), sy(g + 23)), (sx(x + 3), sy(g + 23)))
+            shape.draw_line((sx(x), sy(g + 22)), (sx(x + 12), sy(float(_interp(spec.ground, x + 12)))))
+            continue
         shape.draw_line((sx(x), sy(g)), (sx(x), sy(g + 14)))
         shape.draw_line((sx(x - 2), sy(g + 12.5)), (sx(x + 2), sy(g + 12.5)))
     if spec.pavement or spec.poles:
@@ -183,11 +213,36 @@ def _draw_section(page: fitz.Page, spec: SectionSpec, y_axis: float, x_c: float,
         page.insert_text((sx((a + b) / 2) - 65, y + 13), f"STAGE {sid} CONSTRUCTION", fontsize=10)
 
 
+@dataclass(frozen=True)
+class Scan:
+    """How a scanner degrades a sheet: fed in at an angle (`tilt` degrees,
+    counter-clockwise), optics blur (Gaussian sigma, px), paper grain and
+    sensor noise (grey levels), uneven toner, dust specks, JPEG compression."""
+    tilt: float = 0.0
+    blur: float = 0.0
+    noise: float = 0.0
+    dust: float = 0.0004
+    jpeg: int = 70
+    seed: int = 1
+
+    def apply(self, gray: np.ndarray, rng: np.random.Generator) -> bytes:
+        g = gray.astype(np.float32)
+        if self.blur:
+            g = cv2.GaussianBlur(g, (0, 0), self.blur)
+        if self.tilt:
+            M = cv2.getRotationMatrix2D((g.shape[1] / 2, g.shape[0] / 2), self.tilt, 1.0)
+            g = cv2.warpAffine(g, M, (g.shape[1], g.shape[0]), borderValue=255)
+        g = g * rng.uniform(0.93, 1.0) + rng.normal(0, self.noise, g.shape)
+        g[rng.random(g.shape) < self.dust] = 40
+        ok, jpg = cv2.imencode(".jpg", np.clip(g, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, self.jpeg])
+        return jpg.tobytes()
+
+
 def make_pdf(path: str, pages: list[list[SectionSpec]], scanned: bool = False, dpi: int = 254,
              grid: Grid = Grid(), squares: int | None = None, title: str | None = None,
-             border_below: bool = False) -> None:
+             border_below: bool = False, scan: Scan | None = None) -> None:
     """Stack the sections of each inner list on one 17x11 in sheet, highest
-    station at the top (the usual convention)."""
+    station at the top (the usual convention). `scan`: scanned, degraded so."""
     doc = fitz.open()
     for specs in pages:
         page = doc.new_page(width=1224, height=792)
@@ -206,12 +261,17 @@ def make_pdf(path: str, pages: list[list[SectionSpec]], scanned: bool = False, d
             page.draw_line((40, yb), (1184, yb), width=1.5)
         if title:                                                  # title block, bottom right
             page.insert_text((1000, 760), title, fontsize=14)
-    if scanned:
+    if scanned or scan:
         out = fitz.open()
+        rng = np.random.default_rng(scan.seed if scan else 0)
         for page in doc:
             pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
             p2 = out.new_page(width=page.rect.width, height=page.rect.height)
-            p2.insert_image(p2.rect, pixmap=pix)
+            if scan:
+                gray = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
+                p2.insert_image(p2.rect, stream=scan.apply(gray, rng))
+            else:
+                p2.insert_image(p2.rect, pixmap=pix)
         out.save(path)
     else:
         doc.save(path)
