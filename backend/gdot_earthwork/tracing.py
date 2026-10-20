@@ -54,50 +54,81 @@ def _erase_slivers(line: np.ndarray, min_len: int) -> None:
             line[a:b + 1] = 0
 
 
-def strip_grid(ink: np.ndarray, V, H_, bridge: int = 5, sliver: int = 0) -> np.ndarray:
+def strip_grid(ink: np.ndarray, V, H_, bridge: int = 5, sliver: int = 0, chunk: int = 64,
+               edge: float = 0.15, reach: int = 2) -> np.ndarray:
     """Delete the lattice, then SURGICALLY repair the curves it was crossing.
 
     Only the grid line's own band is erased (frame detection measures it to
     the pixel, antialiased edge rows included). Erasing a wider margin would
     also wipe out any drawn line running along the grid at a shallow angle --
     a 2 % pavement surface near a round elevation loses ~15 ft that way.
+    The band is taken stretch by stretch (`chunk` px along the line): a row
+    beside it, up to `reach` px out, inked over `edge` of a stretch is the
+    line's own edge there. A blurred, resampled or straightened scan softens
+    a line and lets it drift a pixel along its length; its edges fall either
+    side of the ink threshold in fragments which, left standing, get bridged
+    back across the band or chained into a line of their own.
 
     Zeroing a band also punches a hole through every curve that CROSSES it,
     so each band is re-bridged where ink exists on both sides within
     +-`bridge` px: continuity is restored without restoring the grid."""
     m = ink.copy()
-    for s, e in V:
-        m[:, max(0, s):e + 1] = 0
-    for s, e in H_:
-        m[max(0, s):e + 1, :] = 0
+    lines = [(m.T, s_, e) for s_, e in V] + [(m, s_, e) for s_, e in H_]      # each band as rows of a view
+    spans = []
+    for view, s_, e in lines:
+        spans.append(_band_spans(view, s_, e, chunk, edge, reach))
+        for c0, c1, a, b in spans[-1]:
+            view[a:b + 1, c0:c1] = 0
     if sliver:
         # a skewed, uneven or heavier-than-detected grid line leaves long
         # straight slivers beside its band; data lines only cross there
         # briefly, so long runs are grid
-        reach = 4
-        for s, e in H_:
-            for r in list(range(s - reach, s)) + list(range(e + 1, e + 1 + reach)):
-                if 0 <= r < m.shape[0]:
-                    _erase_slivers(m[r], sliver)
-        for s, e in V:
-            for c in list(range(s - reach, s)) + list(range(e + 1, e + 1 + reach)):
-                if 0 <= c < m.shape[1]:
-                    col = m[:, c].copy()
-                    _erase_slivers(col, sliver)
-                    m[:, c] = col
-    for s, e in V:
-        a, b = s - 1, e + 1
-        if a < 0 or b >= m.shape[1]:
-            continue
-        both = _bridged(m[:, a].astype(bool), m[:, b].astype(bool), bridge)
-        m[:, a + 1:b] |= both[:, None].astype(np.uint8)
-    for s, e in H_:
-        a, b = s - 1, e + 1
-        if a < 0 or b >= m.shape[0]:
-            continue
-        both = _bridged(m[a, :].astype(bool), m[b, :].astype(bool), bridge)
-        m[a + 1:b, :] |= both[None, :].astype(np.uint8)
+        near = 4
+        for view, s_, e in lines:
+            for r in list(range(s_ - near, s_)) + list(range(e + 1, e + 1 + near)):
+                if 0 <= r < view.shape[0]:
+                    row = view[r].copy()
+                    _erase_slivers(row, sliver)
+                    view[r] = row
+    for (view, _, _), sp in zip(lines, spans):
+        for c0, c1, a, b in sp:
+            if a - 1 < 0 or b + 1 >= view.shape[0]:
+                continue
+            both = _bridged(view[a - 1, c0:c1].astype(bool), view[b + 1, c0:c1].astype(bool), bridge)
+            view[a:b + 1, c0:c1] |= both[None, :].astype(np.uint8)
     return m
+
+
+def _band_spans(view: np.ndarray, s: int, e: int, chunk: int, edge: float, reach: int, along: float = 0.35):
+    """A grid band (rows s..e of `view`) stretch by stretch: (c0, c1, first
+    row, last row), grown by the rows beside it inked over `edge` of the
+    stretch, up to `reach` rows out -- on a side where the line is soft: its
+    edge shows in `along` of the stretches, all along the line. Beside a
+    sharp line a row is inked only where a drawn line runs close by (a
+    roadbed at a round elevation), and keeps it."""
+    H, W = view.shape
+    a0, b0 = max(0, s), min(H - 1, e)
+    starts = range(0, W, chunk)
+
+    def soft(r):
+        return 0 <= r < H and np.mean([view[r, c0:c0 + chunk].mean() >= edge for c0 in starts]) >= along
+
+    up = next((k - 1 for k in range(1, reach + 1) if not soft(a0 - k)), reach)
+    down = next((k - 1 for k in range(1, reach + 1) if not soft(b0 + k)), reach)
+    if not up and not down:
+        return [(0, W, a0, b0)]
+    out = []
+    for c0 in starts:
+        c1 = min(W, c0 + chunk)
+        a, b = a0, b0
+        for _ in range(up):
+            if a > 0 and view[a - 1, c0:c1].mean() >= edge:
+                a -= 1
+        for _ in range(down):
+            if b < H - 1 and view[b + 1, c0:c1].mean() >= edge:
+                b += 1
+        out.append((c0, c1, a, b))
+    return out
 
 
 def _bridged(a: np.ndarray, b: np.ndarray, bridge: int) -> np.ndarray:
@@ -680,7 +711,8 @@ def template_strokes(solid: np.ndarray, link_px: int, min_px: int, grid_rows: li
     H = solid.shape[0]
     for r in grid_rows or []:
         band = solid[max(0, int(r - grid_tol)):min(H, int(r + grid_tol) + 1)]
-        runs = runs1d(np.flatnonzero(band.any(axis=0)), tol=1)
+        # strokes running into the row, not specks or uprights crossing it
+        runs = [(a, b) for a, b in runs1d(np.flatnonzero(band.any(axis=0)), tol=1) if b - a + 1 >= grid_tol]
         for (_, e), (s_, _) in zip(runs, runs[1:]):
             if link_px < s_ - e <= grid_gap:
                 linked[int(r), e:s_ + 1] = 1

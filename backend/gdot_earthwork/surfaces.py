@@ -67,12 +67,13 @@ LINK_PX = int(2.0 * CANON_PPF)
 # dashes (see tracing.ground_candidates).
 HIDDEN_GROUND_WEIGHT = 1 / 3
 MIN_TEMPLATE_PX = int(15 * CANON_PPF)
+MIN_PIECE_PX = int(5 * CANON_PPF)      # a piece of template split off along a grid line
 
 # A traced point this close (canonical px) to a grid row may be a line that
 # ran on along it and was erased with the grid.
 GRID_TOL_PX = 9.0
 # ... and how far along it such an erased stretch may run.
-GRID_GAP_FT = 30.0
+GRID_GAP_FT = 60.0
 
 
 @dataclass
@@ -261,6 +262,7 @@ def raster_surfaces(frame: Frame, img: PageImage, cfg: PipelineConfig, exclude=N
     V += _partial_grid_lines(ink, V, frame.pitch_x, axis=1)
     Hh += _partial_grid_lines(ink, Hh, frame.pitch_y, axis=0)
     clean = strip_grid(ink, V, Hh, sliver=int(0.8 * min(frame.pitch_x, frame.pitch_y)))
+    clean = _drop_grid_remnants(clean, V)
     sx, sy, W, H = _canon_size(frame, cfg)
     canon = cv2.resize(clean.astype(np.float32), (W, H), interpolation=cv2.INTER_AREA)
     roi = (canon > 0.25).astype(np.uint8)
@@ -268,6 +270,7 @@ def raster_surfaces(frame: Frame, img: PageImage, cfg: PipelineConfig, exclude=N
     m = 3
     roi[:m], roi[-m:], roi[:, :m], roi[:, -m:] = 0, 0, 0, 0
     roi, _ = denoise(roi)
+    roi = _drop_axis_ticks(roi, (frame.top - y0) * sy, (frame.bottom - y0) * sy)
     dash, solid, _, _ = split_dash_solid(roi)
     solid = drop_rulers(solid, int(0.4 * W))
     solid = drop_poles(solid, CANON_PPF)
@@ -285,6 +288,24 @@ def raster_surfaces(frame: Frame, img: PageImage, cfg: PipelineConfig, exclude=N
                               cfg, "raster", refine=True)
     surf.other_pen_ft = other_ft
     return surf
+
+
+def _drop_axis_ticks(mask: np.ndarray, top_row: float, bottom_row: float, band_ft: float = 1.0) -> np.ndarray:
+    """The tick marks along the offset axis (the frame's top and bottom grid
+    lines) are left standing when the grid is erased. On a clean scan they are
+    specks; on a compressed or noisy one the halo of the axis line joins them
+    into one long comb, which outranks the template. Strokes lying wholly
+    within `band_ft` of an axis line are its ticks; a section's line reaching
+    the axis (a ditch drawn into the label strip) runs on out of the band."""
+    band = band_ft * CANON_PPF
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    if n <= 1:
+        return mask
+    y, h = st[1:, cv2.CC_STAT_TOP], st[1:, cv2.CC_STAT_HEIGHT]
+    drop = np.zeros(n, bool)
+    drop[1:] = (((y >= bottom_row - band) & (y + h <= bottom_row + band))
+                | ((y >= top_row - band) & (y + h <= top_row + band)))
+    return np.where(drop[lab], 0, mask).astype(mask.dtype) if drop.any() else mask
 
 
 def _drop_detached_in_margins(mask: np.ndarray, top_row: float, bottom_row: float,
@@ -334,7 +355,9 @@ def trace_design(mask: np.ndarray, ground: dict | None = None, rounds: int = 3,
     of pavement kept), which a note's underline and leader do not -- or
     carries the chain on along a grid line (`grid_rows`, scans): a flat
     roadbed at a round elevation is erased with the grid, which can split
-    the template into pieces further apart than the tracing window."""
+    the template into pieces further apart than the tracing window. Such a
+    piece may be short (MIN_PIECE_PX): on a coarse scan the erased stretch
+    takes a foot of the drawing either side of the grid line with it."""
     chain = snap_top(mask, best_path(candidates(mask)))
     rest, last = mask.copy(), chain
     for _ in range(rounds):
@@ -342,13 +365,16 @@ def trace_design(mask: np.ndarray, ground: dict | None = None, rounds: int = 3,
             break
         rest[:, max(0, min(last) - LINK_PX):max(last) + LINK_PX + 1] = 0
         cols = np.flatnonzero(rest.any(axis=0))
-        if cols.size == 0 or cols[-1] - cols[0] < MIN_TEMPLATE_PX:
+        if cols.size == 0 or cols[-1] - cols[0] < MIN_PIECE_PX:
             break
         last = snap_top(rest, best_path(candidates(rest)))
-        if not last or max(last) - min(last) < MIN_TEMPLATE_PX:
+        if not last or max(last) - min(last) < MIN_PIECE_PX:
             break
         if len(last) < 0.6 * (max(last) - min(last) + 1):
             break                       # hops between scattered marks (lettering), not a drawn line
+        short = max(last) - min(last) < MIN_TEMPLATE_PX
+        if short and not (grid_rows and any(_along_grid(last, e, chain, grid_rows) for e in (min(last), max(last)))):
+            break                       # a short piece only as the far side of an erased stretch
         if ground is not None and not _ties_into(last, ground, chain, grid_rows):
             continue
         chain = {**chain, **{x: y for x, y in last.items() if x not in chain}}
@@ -407,6 +433,26 @@ def _finish_with_retry(ground_px, trace, solid, roi, W, H, cfg, source, refine, 
         return s
     again.trimmed = s.trimmed + again.trimmed
     return again
+
+
+def _drop_grid_remnants(mask: np.ndarray, V, margin: int = 4) -> np.ndarray:
+    """Pieces of the vertical grid lines left standing once the grid is
+    erased: on a blurred, noisy or straightened scan a line's soft edge
+    survives in fragments beside its band, and side by side along the grid
+    rows they outrank the template (template_strokes). A stroke lying wholly
+    within `margin` px of a vertical grid line is such a fragment -- a drawn
+    line crossing it runs on out of that strip, and a wall face lying on one
+    is joined to the rest of the template. (Not along the horizontal grid
+    lines: the dashes of existing ground run there.)"""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    if n <= 1 or not V:
+        return mask
+    x = st[1:, cv2.CC_STAT_LEFT]
+    x1 = x + st[1:, cv2.CC_STAT_WIDTH] - 1
+    drop = np.zeros(n, bool)
+    for s, e in V:
+        drop[1:] |= (x >= s - margin) & (x1 <= e + margin)
+    return np.where(drop[lab], 0, mask).astype(mask.dtype) if drop.any() else mask
 
 
 def _partial_grid_lines(ink: np.ndarray, bands: list[tuple[int, int]], pitch: float,

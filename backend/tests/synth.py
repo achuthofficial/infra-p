@@ -4,13 +4,15 @@ Synthetic cross-section sheets with exactly known answers.
 Draws GDOT-style sections -- 10 ft grid, offset axis with ticks and
 labels, station label, dashed existing ground, solid proposed template --
 into a vector PDF, and optionally a "scanned" copy (the same page rasterized
-and embedded as a single image, with no text layer). Because the geometry
-is generated, the true fill/cut area of every section is known exactly.
+and embedded as a single image, with no text layer), clean or degraded the
+way a real scanner degrades a sheet (Scan). Because the geometry is
+generated, the true fill/cut area of every section is known exactly.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import cv2
 import numpy as np
 import pymupdf as fitz
 
@@ -211,11 +213,36 @@ def _draw_section(page: fitz.Page, spec: SectionSpec, y_axis: float, x_c: float,
         page.insert_text((sx((a + b) / 2) - 65, y + 13), f"STAGE {sid} CONSTRUCTION", fontsize=10)
 
 
+@dataclass(frozen=True)
+class Scan:
+    """How a scanner degrades a sheet: fed in at an angle (`tilt` degrees,
+    counter-clockwise), optics blur (Gaussian sigma, px), paper grain and
+    sensor noise (grey levels), uneven toner, dust specks, JPEG compression."""
+    tilt: float = 0.0
+    blur: float = 0.0
+    noise: float = 0.0
+    dust: float = 0.0004
+    jpeg: int = 70
+    seed: int = 1
+
+    def apply(self, gray: np.ndarray, rng: np.random.Generator) -> bytes:
+        g = gray.astype(np.float32)
+        if self.blur:
+            g = cv2.GaussianBlur(g, (0, 0), self.blur)
+        if self.tilt:
+            M = cv2.getRotationMatrix2D((g.shape[1] / 2, g.shape[0] / 2), self.tilt, 1.0)
+            g = cv2.warpAffine(g, M, (g.shape[1], g.shape[0]), borderValue=255)
+        g = g * rng.uniform(0.93, 1.0) + rng.normal(0, self.noise, g.shape)
+        g[rng.random(g.shape) < self.dust] = 40
+        ok, jpg = cv2.imencode(".jpg", np.clip(g, 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, self.jpeg])
+        return jpg.tobytes()
+
+
 def make_pdf(path: str, pages: list[list[SectionSpec]], scanned: bool = False, dpi: int = 254,
              grid: Grid = Grid(), squares: int | None = None, title: str | None = None,
-             border_below: bool = False) -> None:
+             border_below: bool = False, scan: Scan | None = None) -> None:
     """Stack the sections of each inner list on one 17x11 in sheet, highest
-    station at the top (the usual convention)."""
+    station at the top (the usual convention). `scan`: scanned, degraded so."""
     doc = fitz.open()
     for specs in pages:
         page = doc.new_page(width=1224, height=792)
@@ -234,12 +261,17 @@ def make_pdf(path: str, pages: list[list[SectionSpec]], scanned: bool = False, d
             page.draw_line((40, yb), (1184, yb), width=1.5)
         if title:                                                  # title block, bottom right
             page.insert_text((1000, 760), title, fontsize=14)
-    if scanned:
+    if scanned or scan:
         out = fitz.open()
+        rng = np.random.default_rng(scan.seed if scan else 0)
         for page in doc:
             pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
             p2 = out.new_page(width=page.rect.width, height=page.rect.height)
-            p2.insert_image(p2.rect, pixmap=pix)
+            if scan:
+                gray = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
+                p2.insert_image(p2.rect, stream=scan.apply(gray, rng))
+            else:
+                p2.insert_image(p2.rect, pixmap=pix)
         out.save(path)
     else:
         doc.save(path)

@@ -52,12 +52,14 @@ def test_ground_near_the_template_is_not_welded_to_it_across_a_grid_line():
 
 
 def test_a_thin_shallow_line_stays_whole_across_a_heavier_grid_line():
-    ink = np.zeros((40, 80), np.uint8)
+    ink = np.zeros((40, 640), np.uint8)
     ink[10:15, :] = 1                # a heavy grid row
-    ink[9, :30] = 1                  # a thin line running in above it ...
-    ink[15, 33:] = 1                 # ... and out below, 3 columns on
+    for x in range(200, 300):        # a thin line coming down onto it ...
+        ink[max(0, 9 - (300 - x) // 12), x] = 1
+    ink[15, 303:320] = 1             # ... and leaving below, 3 columns on
+    for x in range(320, 420):
+        ink[min(39, 15 + (x - 320) // 12), x] = 1
     m = strip_grid(ink, [], [(10, 14)])
     n, _ = cv2.connectedComponents(m, connectivity=8)
     assert n == 2                    # background + one line
-
-    assert not m[10:15, :20].any() and not m[10:15, 45:].any()   # the grid row itself stays erased
+    assert not m[10:15, :280].any() and not m[10:15, 330:].any()   # the grid row itself stays erased
